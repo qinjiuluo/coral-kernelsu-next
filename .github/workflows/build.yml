@@ -57,6 +57,19 @@ jobs:
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
             | bash -s builtin
 
+      - name: Patch SukiSU builtin source bugs (upstream #992)
+        # 1. supercall.h: KSU_IOCTL_KPM 重复定义且引用已删除的 ksu_manager_cmd → 删除 106 那行
+        # 2. kpm.c 裸用 2 参 access_ok, 4.14 是 3 参宏 → 换兼容封装 ksu_access_ok
+        run: |
+          set -euxo pipefail
+          KSU_DIR="$GITHUB_WORKSPACE/kernel/private/msm-google/KernelSU/kernel"
+          sed -i '/ksu_manager_cmd/d' "$KSU_DIR/include/uapi/supercall.h"
+          sed -i 's/\baccess_ok(/ksu_access_ok(/g' "$KSU_DIR/kpm/kpm.c"
+          grep -q 'infra/kernel_compat.h' "$KSU_DIR/kpm/kpm.c" || \
+            sed -i '/#include <linux\/uaccess.h>/a #include "infra/kernel_compat.h"' "$KSU_DIR/kpm/kpm.c"
+          grep -n "KSU_IOCTL_KPM" "$KSU_DIR/include/uapi/supercall.h"
+          grep -n "ksu_access_ok" "$KSU_DIR/kpm/kpm.c" | head -3
+
       - name: Apply SUSFS kernel patches (4.14 branch)
         run: |
           set -euxo pipefail
