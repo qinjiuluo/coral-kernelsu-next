@@ -48,11 +48,9 @@ jobs:
 
       - name: Show source revision
         run: |
-          cd "$GITHUB_WORKSPACE/kernel"
-          repo manifest -r > pinned-manifest.xml || true
-          git -C private/msm-google log -1 --oneline
+          git -C "$GITHUB_WORKSPACE/kernel/private/msm-google" log -1 --oneline
 
-      - name: Integrate SukiSU-Ultra (builtin branch)
+      - name: Integrate SukiSU-Ultra (builtin branch, manual hook entry points)
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
@@ -70,23 +68,40 @@ jobs:
           cp ../../susfs4ksu/kernel_patches/fs/* fs/
           cp ../../susfs4ksu/kernel_patches/include/linux/* include/linux/
           patch -p1 --forward < 50_add_susfs_in_kernel-4.14.patch || true
-          echo "=== rejected hunks (if any) ==="
-          find . -name "*.rej" -not -path "./out/*" | head -20
+          echo "=== rejected hunks after susfs patch ==="
+          find . -name "*.rej" -not -path "./out/*"
 
-      - name: Apply SUSFS glue patch into SukiSU
-        # 10_enable_susfs_for_ksu.patch 是把 ksu_handle_* 接进系统调用的必要胶水,
-        # 按 weishu KSU 行号编写, 打 SukiSU 可能有 hunk 冲突, 失败则构建中止待手工修
+      - name: Apply coral fdinfo fixup (adapts susfs hunk to coral's fsnotify backport)
+        # coral 的 fdinfo.c 被 Google 回填过新版 fsnotify (mask/ignored_mask),
+        # susfs 4.14 补丁的 hunk #4 会 reject, 此 fixup 手工作业 + 顺带修 fanotify 签名
         run: |
           set -euxo pipefail
-          cd "$GITHUB_WORKSPACE/kernel/private/msm-google/KernelSU"
-          cp ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch .
-          if ! patch -p1 --dry-run < 10_enable_susfs_for_ksu.patch; then
-            echo "=== DRY RUN FAILED, showing rejects ==="
-            patch -p1 --forward < 10_enable_susfs_for_ksu.patch || true
-            find . -name "*.rej" -exec echo "--- {} ---" \; -exec cat {} \;
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          patch -p1 < "$GITHUB_WORKSPACE/scripts/coral_fdinfo_susfs_fixup.patch"
+          rm -f fs/notify/fdinfo.c.rej fs/notify/fdinfo.c.orig
+
+      - name: Apply official SukiSU manual hooks for 4.14
+        # 官方补丁仓 SukiSU-Ultra/SukiSU_patch, 注入 execveat/faccessat/stat/read/reboot 等调用点
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/main/4.14/ksu_hooks_4.14.patch" -o ksu_hooks_4.14.patch
+          patch -p1 --forward < ksu_hooks_4.14.patch || true
+          echo "=== rejected hunks after hooks patch ==="
+          find . -name "*.rej" -not -path "./out/*"
+
+      - name: Apply coral hooks fixup (exec.c 函数结构差异 + stat.c SUS_SU 上下文缺失)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          patch -p1 < "$GITHUB_WORKSPACE/scripts/coral_hooks_fixup.patch"
+          rm -f fs/exec.c.rej fs/exec.c.orig fs/stat.c.rej fs/stat.c.orig
+          # 白名单外的 reject 一律炸出来
+          UNEXPECTED=$(find . -name "*.rej" -not -path "./out/*")
+          if [ -n "$UNEXPECTED" ]; then
+            echo "Unexpected rejects: $UNEXPECTED"
             exit 1
           fi
-          patch -p1 < 10_enable_susfs_for_ksu.patch
 
       - name: Enable configs in floral_defconfig
         run: |
@@ -129,7 +144,6 @@ jobs:
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
           cd "$GITHUB_WORKSPACE/kernel"
-          cp pinned-manifest.xml "$GITHUB_WORKSPACE/artifacts/" || true
           find out -type f \( \
             -name 'Image.lz4-dtb' -o \
             -name 'Image.lz4' -o \
