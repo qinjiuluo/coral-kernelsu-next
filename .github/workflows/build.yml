@@ -185,12 +185,15 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           gh release download stock-boot -R qinjiuluo/coral-kernelsu-next -p coral-b2-stock-boot.img --clobber
           cd scripts/mkbootimg
-          python3 unpack_bootimg.py --boot_img "$GITHUB_WORKSPACE/coral-b2-stock-boot.img" --out unpacked
+          # 注意顺序: 先解包+生成参数, 再覆盖 kernel —— 反了会被 stock kernel 回冲
+          ARGS=$(python3 unpack_bootimg.py --boot_img "$GITHUB_WORKSPACE/coral-b2-stock-boot.img" --out unpacked --format mkbootimg)
           KERNEL_IMG=$(find "$GITHUB_WORKSPACE/kernel/out" -name 'Image.lz4-dtb' | head -1)
           test -n "$KERNEL_IMG"
           cp "$KERNEL_IMG" unpacked/kernel
-          ARGS=$(python3 unpack_bootimg.py --boot_img "$GITHUB_WORKSPACE/coral-b2-stock-boot.img" --out unpacked --format mkbootimg)
           eval "python3 mkbootimg.py $ARGS -o new-boot.img"
+          # 防回归: 校验新镜像里的内核 == CI 构建的内核
+          python3 unpack_bootimg.py --boot_img new-boot.img --out verify >/dev/null
+          cmp verify/kernel "$KERNEL_IMG" || { echo 'FATAL: repacked kernel mismatch'; exit 1; }
           cp new-boot.img "$GITHUB_WORKSPACE/artifacts/"
           echo "=== repacked new-boot.img ==="
           ls -la new-boot.img
