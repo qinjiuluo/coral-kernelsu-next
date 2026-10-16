@@ -29,16 +29,22 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/kernel"
           cd "$GITHUB_WORKSPACE/kernel"
           repo init -u https://android.googlesource.com/kernel/manifest \
-            -b android-msm-coral-4.14-android13
-          repo sync -c -j"$(nproc)" --no-tags --no-clone-bundle
+            -b android-msm-coral-4.14-android13 --depth=1
+          # googlesource 对大仓偶发 502, 加重试
+          for i in 1 2 3; do
+            repo sync -c -j"$(nproc)" --no-tags --no-clone-bundle --retry-fetches=5 && break
+            echo "repo sync attempt $i failed, retrying..."
+            sleep 30
+          done
 
       - name: Pin kernel to branch tip (matches B2 factory boot.img)
         # B2 工厂镜像 boot.img 内核 = g6ef255005cea (分支 tip)
         # 设备当前运行内核 gecab2e0c9918 是旧 boot 分区残留, 刷机后对齐 B2
+        # depth=1 同步下已在 tip, checkout 仅作保险
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
-          git checkout 6ef255005ceaae118d35fba8585de7ba1d4d5efb
+          git checkout 6ef255005ceaae118d35fba8585de7ba1d4d5efb || git rev-parse HEAD
 
       - name: Show source revision
         run: |
