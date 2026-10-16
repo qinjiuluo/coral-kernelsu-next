@@ -113,6 +113,14 @@ jobs:
             exit 1
           fi
 
+      - name: Apply vermagic bypass (vendor 预置模块版本串与自编译内核不一致)
+        # 内核 release 被 KSUN 改写为 _KernelSU-g<commit>, 与 vendor .ko 的 vermagic 不符;
+        # MODVERSIONS=n 时 same_magic 全串比对必炸 → 内核层放行 (同源 ABI 兼容)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          git apply "$GITHUB_WORKSPACE/scripts/coral_vermagic_bypass.patch"
+
       - name: Enable configs in floral_defconfig
         # sidex15 fork Kconfig 选项集; 不开 KSU_KPROBES_HOOK (manual hook 模式)
         run: |

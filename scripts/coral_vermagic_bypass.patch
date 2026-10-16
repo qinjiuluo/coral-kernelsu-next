@@ -1,0 +1,18 @@
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -1370,12 +1370,14 @@
+ static inline int check_modstruct_version(const struct load_info *info,
+ 					  struct module *mod)
+ {
+ 	return 1;
+ }
+ 
+ static inline int same_magic(const char *amagic, const char *bmagic,
+ 			     bool has_crcs)
+ {
+-	return strcmp(amagic, bmagic) == 0;
++	/* coral: vendor prebuilt modules carry stock vermagic; our kernel
++	 * release string differs (_KernelSU-g<commit>). Same-source ABI, allow. */
++	return 1;
+ }
+ #endif /* CONFIG_MODVERSIONS */
