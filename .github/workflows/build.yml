@@ -178,25 +178,22 @@ jobs:
           find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -ls || true
 
       - name: Repack stock boot.img with new kernel
-        # 用官方补丁仓自带的 magiskboot 解包原厂 boot, 换内核重打包, 产出可直接刷入的镜像
+        # SukiSU_patch 里的 magiskboot 是 ARM64 二进制, x86 runner 跑不了;
+        # 用 AOSP 纯 python mkbootimg 工具链 (已本地验证 round-trip 无损)
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE"
-          curl -L -o magiskboot "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/main/AnyKernel3/tools/magiskboot"
-          chmod +x magiskboot
           gh release download stock-boot -R qinjiuluo/coral-kernelsu-next -p coral-b2-stock-boot.img --clobber
-          mkdir -p repack && cd repack
-          ../magiskboot unpack ../coral-b2-stock-boot.img
+          cd scripts/mkbootimg
+          python3 unpack_bootimg.py --boot_img "$GITHUB_WORKSPACE/coral-b2-stock-boot.img" --out unpacked
           KERNEL_IMG=$(find "$GITHUB_WORKSPACE/kernel/out" -name 'Image.lz4-dtb' | head -1)
-          if [ -n "$KERNEL_IMG" ]; then
-            cp "$KERNEL_IMG" kernel
-            ../magiskboot repack ../coral-b2-stock-boot.img new-boot.img
-            cp new-boot.img "$GITHUB_WORKSPACE/artifacts/"
-            echo "=== repacked new-boot.img ==="
-          else
-            echo "No Image.lz4-dtb found, skip repack"
-            exit 1
-          fi
+          test -n "$KERNEL_IMG"
+          cp "$KERNEL_IMG" unpacked/kernel
+          ARGS=$(python3 unpack_bootimg.py --boot_img "$GITHUB_WORKSPACE/coral-b2-stock-boot.img" --out unpacked --format mkbootimg)
+          eval "python3 mkbootimg.py $ARGS -o new-boot.img"
+          cp new-boot.img "$GITHUB_WORKSPACE/artifacts/"
+          echo "=== repacked new-boot.img ==="
+          ls -la new-boot.img
         env:
           GH_TOKEN: ${{ github.token }}
 
