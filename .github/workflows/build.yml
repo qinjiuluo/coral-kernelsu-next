@@ -140,6 +140,14 @@ jobs:
             fi
           done
 
+          # 默认 defconfig 是全量 LTO (CONFIG_LTO_CLANG=y + THINLTO off),
+          # runner 链接阶段内存爆炸被 cancel → 切 ThinLTO (保留 CFI)
+          if grep -q "^# CONFIG_THINLTO is not set$" "$DEFCONFIG"; then
+            sed -i "s/^# CONFIG_THINLTO is not set$/CONFIG_THINLTO=y/" "$DEFCONFIG"
+          elif ! grep -q "^CONFIG_THINLTO=y" "$DEFCONFIG"; then
+            printf 'CONFIG_THINLTO=y\n' >> "$DEFCONFIG"
+          fi
+
           # defconfig 归一化, 让 Google check_defconfig 校验通过
           make O="$GITHUB_WORKSPACE/kernel/out/defconfig-normalize" \
             ARCH=arm64 CC=clang HOSTCC=clang LD=ld.lld floral_defconfig
