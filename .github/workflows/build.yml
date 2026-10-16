@@ -50,17 +50,15 @@ jobs:
         run: |
           git -C "$GITHUB_WORKSPACE/kernel/private/msm-google" log -1 --oneline
 
-      - name: Integrate KernelSU-Next (sidex15 fork, SUSFS glue built-in)
-        # sidex15 是 susfs 合作者, 其 KSUN fork 已内置 susfs 胶水 (10_enable_susfs 无需再打)
+      - name: Integrate KernelSU-Next (sidex15 fork, next-susfs_v1.5.5-v1.5.7)
+        # sidex15 是 susfs 合作者, 该分支 SUSFS 胶水内置且 API 与 susfs kernel-4.14 分支(v1.5.5)匹配
+        # (注: fork 的 aa12c9ba 是带冲突标记的 WIP merge, 勿用)
         # CONFIG_KSU_KPROBES_HOOK 缺省关闭 = manual hook 模式, 适配无 KPROBES 的 coral
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
-          git clone https://github.com/sidex15/KernelSU-Next.git KernelSU
-          cd KernelSU
-          git fetch --depth 1 origin aa12c9baef15b535ae530fc0b5dc8ede6486be5f
-          git checkout --detach FETCH_HEAD
-          cd ..
+          git clone --depth 1 -b next-susfs_v1.5.5-v1.5.7 \
+            https://github.com/sidex15/KernelSU-Next.git KernelSU
           ln -sf "$(realpath --relative-to=drivers KernelSU/kernel)" drivers/kernelsu
           grep -q "kernelsu" drivers/Makefile || \
             printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
