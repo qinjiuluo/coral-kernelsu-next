@@ -154,6 +154,29 @@ jobs:
           \) -print -exec cp -n {} "$GITHUB_WORKSPACE/artifacts/" \; || true
           find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -ls || true
 
+      - name: Repack stock boot.img with new kernel
+        # 用官方补丁仓自带的 magiskboot 解包原厂 boot, 换内核重打包, 产出可直接刷入的镜像
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE"
+          curl -L -o magiskboot "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/main/AnyKernel3/tools/magiskboot"
+          chmod +x magiskboot
+          gh release download stock-boot -R qinjiuluo/coral-kernelsu-next -p coral-b2-stock-boot.img --clobber
+          mkdir -p repack && cd repack
+          ../magiskboot unpack ../coral-b2-stock-boot.img
+          KERNEL_IMG=$(find "$GITHUB_WORKSPACE/kernel/out" -name 'Image.lz4-dtb' | head -1)
+          if [ -n "$KERNEL_IMG" ]; then
+            cp "$KERNEL_IMG" kernel
+            ../magiskboot repack ../coral-b2-stock-boot.img new-boot.img
+            cp new-boot.img "$GITHUB_WORKSPACE/artifacts/"
+            echo "=== repacked ==="
+            ../magiskboot unpack new-boot.img && ls -la
+          else
+            echo "No Image.lz4-dtb found, skip repack"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Upload kernel artifacts
         if: always()
         uses: actions/upload-artifact@v4
