@@ -30,7 +30,7 @@
 +out_free_pathname:
 +			kfree(pathname);
 +		}
-+out_seq_printf:
++out_seq_printf:	;
 +#endif
  		/*
  		 * IN_ALL_EVENTS represents all of the mask bits
