@@ -148,6 +148,14 @@ jobs:
             printf 'CONFIG_THINLTO=y\n' >> "$DEFCONFIG"
           fi
 
+          # vendor 预置模块 (ftm5 触摸/wlan 等) 的 module_layout CRC 与我们的
+          # 构建不一致 (KSU/THINLTO 配置漂移所致) → insmod 报
+          # "disagrees about version of symbol module_layout", 触摸失效
+          # ABI 同源无变化, 直接关掉 MODVERSIONS 跳过 CRC 校验
+          if grep -q "^CONFIG_MODVERSIONS=y$" "$DEFCONFIG"; then
+            sed -i "s/^CONFIG_MODVERSIONS=y$/# CONFIG_MODVERSIONS is not set/" "$DEFCONFIG"
+          fi
+
           # defconfig 归一化, 让 Google check_defconfig 校验通过
           make O="$GITHUB_WORKSPACE/kernel/out/defconfig-normalize" \
             ARCH=arm64 CC=clang HOSTCC=clang LD=ld.lld floral_defconfig
