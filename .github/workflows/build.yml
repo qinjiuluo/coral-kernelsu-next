@@ -1,4 +1,4 @@
-name: Build coral SukiSU-Ultra + SUSFS
+name: Build coral KernelSU-Next + SUSFS
 
 on:
   workflow_dispatch:
@@ -50,25 +50,22 @@ jobs:
         run: |
           git -C "$GITHUB_WORKSPACE/kernel/private/msm-google" log -1 --oneline
 
-      - name: Integrate SukiSU-Ultra (builtin branch, manual hook entry points)
+      - name: Integrate KernelSU-Next (sidex15 fork, SUSFS glue built-in)
+        # sidex15 是 susfs 合作者, 其 KSUN fork 已内置 susfs 胶水 (10_enable_susfs 无需再打)
+        # CONFIG_KSU_KPROBES_HOOK 缺省关闭 = manual hook 模式, 适配无 KPROBES 的 coral
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
-            | bash -s builtin
-
-      - name: Patch SukiSU builtin source bugs (upstream #992)
-        # 1. supercall.h: KSU_IOCTL_KPM 重复定义且引用已删除的 ksu_manager_cmd → 删除 106 那行
-        # 2. kpm.c 裸用 2 参 access_ok, 4.14 是 3 参宏 → 换兼容封装 ksu_access_ok
-        run: |
-          set -euxo pipefail
-          KSU_DIR="$GITHUB_WORKSPACE/kernel/private/msm-google/KernelSU/kernel"
-          sed -i '/ksu_manager_cmd/d' "$KSU_DIR/include/uapi/supercall.h"
-          sed -i 's/\baccess_ok(/ksu_access_ok(/g' "$KSU_DIR/kpm/kpm.c"
-          grep -q 'infra/kernel_compat.h' "$KSU_DIR/kpm/kpm.c" || \
-            sed -i '/#include <linux\/uaccess.h>/a #include "infra/kernel_compat.h"' "$KSU_DIR/kpm/kpm.c"
-          grep -n "KSU_IOCTL_KPM" "$KSU_DIR/include/uapi/supercall.h"
-          grep -n "ksu_access_ok" "$KSU_DIR/kpm/kpm.c" | head -3
+          git clone https://github.com/sidex15/KernelSU-Next.git KernelSU
+          cd KernelSU
+          git fetch --depth 1 origin aa12c9baef15b535ae530fc0b5dc8ede6486be5f
+          git checkout --detach FETCH_HEAD
+          cd ..
+          ln -sf "$(realpath --relative-to=drivers KernelSU/kernel)" drivers/kernelsu
+          grep -q "kernelsu" drivers/Makefile || \
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || \
+            sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 
       - name: Apply SUSFS kernel patches (4.14 branch)
         run: |
@@ -86,7 +83,8 @@ jobs:
 
       - name: Apply coral fdinfo fixup (adapts susfs hunk to coral's fsnotify backport)
         # coral 的 fdinfo.c 被 Google 回填过新版 fsnotify (mask/ignored_mask),
-        # susfs 4.14 补丁的 hunk #4 会 reject, 此 fixup 手工作业 + 顺带修 fanotify 签名
+        # susfs 4.14 补丁的 hunk #4 会 reject; 此 fixup 手工作业:
+        # 声明提前(C90) + fanotify 签名对齐
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
@@ -94,7 +92,8 @@ jobs:
           rm -f fs/notify/fdinfo.c.rej fs/notify/fdinfo.c.orig
 
       - name: Apply official SukiSU manual hooks for 4.14
-        # 官方补丁仓 SukiSU-Ultra/SukiSU_patch, 注入 execveat/faccessat/stat/read/reboot 等调用点
+        # 官方补丁仓 SukiSU-Ultra/SukiSU_patch, 注入 execveat/faccessat/stat/read/devpts/input/umount 调用点
+        # 其 handler 签名与 sidex15 KSUN fork 匹配 (已逐一核对)
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
@@ -117,18 +116,23 @@ jobs:
           fi
 
       - name: Enable configs in floral_defconfig
+        # sidex15 fork Kconfig 选项集; 不开 KSU_KPROBES_HOOK (manual hook 模式)
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
           DEFCONFIG="arch/arm64/configs/floral_defconfig"
           test -f "$DEFCONFIG"
-          for opt in CONFIG_KSU CONFIG_KPM \
+          for opt in CONFIG_KSU \
                      CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH \
                      CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SUS_KSTAT \
+                     CONFIG_KSU_SUSFS_TRY_UMOUNT \
+                     CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+                     CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+                     CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
                      CONFIG_KSU_SUSFS_SPOOF_UNAME \
                      CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
                      CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
-                     CONFIG_KSU_SUSFS_OPEN_REDIRECT CONFIG_KSU_SUSFS_SUS_MAP; do
+                     CONFIG_KSU_SUSFS_OPEN_REDIRECT; do
             if grep -q "^# $opt is not set$" "$DEFCONFIG"; then
               sed -i "s/^# $opt is not set$/$opt=y/" "$DEFCONFIG"
             elif grep -q "^$opt=" "$DEFCONFIG"; then
@@ -182,10 +186,10 @@ jobs:
             cp "$KERNEL_IMG" kernel
             ../magiskboot repack ../coral-b2-stock-boot.img new-boot.img
             cp new-boot.img "$GITHUB_WORKSPACE/artifacts/"
-            echo "=== repacked ==="
-            ../magiskboot unpack new-boot.img && ls -la
+            echo "=== repacked new-boot.img ==="
           else
             echo "No Image.lz4-dtb found, skip repack"
+            exit 1
           fi
         env:
           GH_TOKEN: ${{ github.token }}
