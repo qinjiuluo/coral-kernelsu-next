@@ -1,4 +1,4 @@
-name: Build coral KernelSU Next
+name: Build coral SukiSU-Ultra + SUSFS
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: Checkout build scripts
@@ -17,7 +17,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             bc bison build-essential ccache curl flex git libelf-dev \
-            libssl-dev python3 repo rsync unzip zip
+            libssl-dev python3 repo rsync unzip zip patch
 
       - name: Configure git
         run: |
@@ -32,55 +32,78 @@ jobs:
             -b android-msm-coral-4.14-android13
           repo sync -c -j"$(nproc)" --no-tags --no-clone-bundle
 
+      - name: Pin kernel to device-matched commit
+        # 设备实测内核: 4.14.276-gecab2e0c9918-ab8931408 (build TP1A.221005.002.B2)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          git checkout ecab2e0c9918ad13
+
       - name: Show source revision
         run: |
           cd "$GITHUB_WORKSPACE/kernel"
-          repo manifest -r > pinned-manifest.xml
-          git -C private/msm-google log -1 --oneline || true
+          repo manifest -r > pinned-manifest.xml || true
+          git -C private/msm-google log -1 --oneline
 
-      - name: Integrate KernelSU Next legacy
-        shell: bash
+      - name: Integrate SukiSU-Ultra (builtin branch)
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+            | bash -s builtin
 
-          KSU_REF="v3.4.0-legacy"
-
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${KSU_REF}/kernel/setup.sh" \
-            | bash -s "${KSU_REF}"
-
-      - name: Apply coral manual hooks
-        shell: bash
+      - name: Apply SUSFS kernel patches (4.14 branch)
         run: |
           set -euxo pipefail
-          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
-          python3 "$GITHUB_WORKSPACE/scripts/patch_ksun_manual_hooks.py"
+          cd "$GITHUB_WORKSPACE/kernel"
+          git clone --depth 1 -b kernel-4.14 \
+            https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+          cd private/msm-google
+          cp ../../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch .
+          cp ../../susfs4ksu/kernel_patches/fs/* fs/
+          cp ../../susfs4ksu/kernel_patches/include/linux/* include/linux/
+          patch -p1 --forward < 50_add_susfs_in_kernel-4.14.patch || true
+          echo "=== rejected hunks (if any) ==="
+          find . -name "*.rej" -not -path "./out/*" | head -20
 
-      - name: Enable KernelSU
-        shell: bash
+      - name: Apply SUSFS glue patch into SukiSU
+        # 10_enable_susfs_for_ksu.patch 是把 ksu_handle_* 接进系统调用的必要胶水,
+        # 按 weishu KSU 行号编写, 打 SukiSU 可能有 hunk 冲突, 失败则构建中止待手工修
         run: |
           set -euxo pipefail
-          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
-
-          DEFCONFIG="arch/arm64/configs/floral_defconfig"
-          if [ ! -f "$DEFCONFIG" ]; then
-            echo "Could not find $DEFCONFIG"
-            find arch/arm64/configs -maxdepth 1 -type f | grep -E 'floral|coral' || true
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google/KernelSU"
+          cp ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch .
+          if ! patch -p1 --dry-run < 10_enable_susfs_for_ksu.patch; then
+            echo "=== DRY RUN FAILED, showing rejects ==="
+            patch -p1 --forward < 10_enable_susfs_for_ksu.patch || true
+            find . -name "*.rej" -exec echo "--- {} ---" \; -exec cat {} \;
             exit 1
           fi
+          patch -p1 < 10_enable_susfs_for_ksu.patch
 
-          for opt in CONFIG_KSU CONFIG_KSU_MANUAL_HOOK; do
+      - name: Enable configs in floral_defconfig
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          DEFCONFIG="arch/arm64/configs/floral_defconfig"
+          test -f "$DEFCONFIG"
+          for opt in CONFIG_KSU CONFIG_KPM \
+                     CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH \
+                     CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SUS_KSTAT \
+                     CONFIG_KSU_SUSFS_SPOOF_UNAME \
+                     CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+                     CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+                     CONFIG_KSU_SUSFS_OPEN_REDIRECT CONFIG_KSU_SUSFS_SUS_MAP; do
             if grep -q "^# $opt is not set$" "$DEFCONFIG"; then
               sed -i "s/^# $opt is not set$/$opt=y/" "$DEFCONFIG"
             elif grep -q "^$opt=" "$DEFCONFIG"; then
               sed -i "s/^$opt=.*/$opt=y/" "$DEFCONFIG"
             else
-              printf '\n%s=y\n' "$opt" >> "$DEFCONFIG"
+              printf '%s=y\n' "$opt" >> "$DEFCONFIG"
             fi
           done
 
-          # Normalize defconfig exactly as Kconfig expects so Google's
-          # POST_DEFCONFIG_CMDS=check_defconfig validation passes.
+          # defconfig 归一化, 让 Google check_defconfig 校验通过
           make O="$GITHUB_WORKSPACE/kernel/out/defconfig-normalize" \
             ARCH=arm64 CC=clang HOSTCC=clang LD=ld.lld floral_defconfig
           make O="$GITHUB_WORKSPACE/kernel/out/defconfig-normalize" \
@@ -88,7 +111,6 @@ jobs:
           cp "$GITHUB_WORKSPACE/kernel/out/defconfig-normalize/defconfig" "$DEFCONFIG"
 
       - name: Build kernel
-        shell: bash
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel"
@@ -97,28 +119,24 @@ jobs:
 
       - name: Collect outputs
         if: always()
-        shell: bash
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
           cd "$GITHUB_WORKSPACE/kernel"
-
           cp pinned-manifest.xml "$GITHUB_WORKSPACE/artifacts/" || true
-
           find out -type f \( \
-            -name 'Image' -o \
+            -name 'Image.lz4-dtb' -o \
             -name 'Image.lz4' -o \
             -name 'Image.gz' -o \
-            -name 'boot.img' -o \
+            -name 'Image' -o \
             -name 'dtbo.img' -o \
-            -name 'vendor_boot.img' \
+            -name 'boot.img' \
           \) -print -exec cp -n {} "$GITHUB_WORKSPACE/artifacts/" \; || true
-
           find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -ls || true
 
       - name: Upload kernel artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coral-kernelsu-next
+          name: coral-sukisu-susfs
           path: artifacts/
           if-no-files-found: warn
