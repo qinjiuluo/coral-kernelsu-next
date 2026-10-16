@@ -32,12 +32,13 @@ jobs:
             -b android-msm-coral-4.14-android13
           repo sync -c -j"$(nproc)" --no-tags --no-clone-bundle
 
-      - name: Pin kernel to device-matched commit
-        # 设备实测内核: 4.14.276-gecab2e0c9918-ab8931408 (build TP1A.221005.002.B2)
+      - name: Pin kernel to branch tip (matches B2 factory boot.img)
+        # B2 工厂镜像 boot.img 内核 = g6ef255005cea (分支 tip)
+        # 设备当前运行内核 gecab2e0c9918 是旧 boot 分区残留, 刷机后对齐 B2
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
-          git checkout ecab2e0c9918ad13
+          git checkout 6ef255005ceaae118d35fba8585de7ba1d4d5efb
 
       - name: Show source revision
         run: |
