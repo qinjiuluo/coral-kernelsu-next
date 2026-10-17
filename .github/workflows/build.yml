@@ -203,6 +203,9 @@ jobs:
           export KBUILD_BUILD_USER="android-build"
           export KBUILD_BUILD_HOST="abfarm-2004-0533"
           export KBUILD_BUILD_TIMESTAMP="Wed Sep 14 08:05:09 UTC 2022"
+          # 4.14 Makefile: LOCALVERSION_AUTO=n 且环境变量 LOCALVERSION 未 set 时,
+          # 会检查 git dirty 并追加 '+' —— export 空值(即 set)即可跳过
+          export LOCALVERSION=""
           # _setup_env.sh 会把 KBUILD_BUILD_VERSION 设为 "1 repo:<分支>", 原厂是干净的 "1"
           sed -i 's|export KBUILD_BUILD_VERSION="1 repo:$repo_branch"|export KBUILD_BUILD_VERSION="1"|' \
             build/_setup_env.sh
