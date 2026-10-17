@@ -176,6 +176,8 @@ jobs:
           if grep -q "^CONFIG_LOCALVERSION_AUTO=y$" "$DEFCONFIG"; then
             sed -i "s/^CONFIG_LOCALVERSION_AUTO=y$/# CONFIG_LOCALVERSION_AUTO is not set/" "$DEFCONFIG"
           fi
+          # 原 defconfig 可能没有该行(默认 y), 必须显式写入, 否则 savedefconfig 归一化时又写回 y
+          grep -q "CONFIG_LOCALVERSION_AUTO" "$DEFCONFIG" || printf '# CONFIG_LOCALVERSION_AUTO is not set\n' >> "$DEFCONFIG"
 
           # defconfig 归一化, 让 Google check_defconfig 校验通过
           make O="$GITHUB_WORKSPACE/kernel/out/defconfig-normalize" \
