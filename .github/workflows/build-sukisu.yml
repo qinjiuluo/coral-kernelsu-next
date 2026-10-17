@@ -1,0 +1,285 @@
+name: Build coral SukiSU (experimental)
+
+on:
+  workflow_dispatch:
+    inputs:
+      with_susfs:
+        description: Integrate SUSFS 1.5.5 kernel patches (susfs4ksu kernel-4.14)
+        required: true
+        default: "true"
+      sukisu_ref:
+        description: SukiSU-Ultra branch/tag/commit
+        required: true
+        default: "builtin"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex git libelf-dev \
+            libssl-dev python3 repo rsync unzip zip patch
+
+      - name: Configure git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Init Google Pixel 4 XL Android 13 kernel tree
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/kernel"
+          cd "$GITHUB_WORKSPACE/kernel"
+          repo init -u https://android.googlesource.com/kernel/manifest \
+            -b android-msm-coral-4.14-android13 --depth=1
+          for i in 1 2 3; do
+            repo sync -c -j"$(nproc)" --no-tags --no-clone-bundle --retry-fetches=5 && break
+            echo "repo sync attempt $i failed, retrying..."
+            sleep 30
+          done
+
+      - name: Pin kernel to branch tip (matches B2 factory boot.img)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          git checkout 6ef255005ceaae118d35fba8585de7ba1d4d5efb || git rev-parse HEAD
+
+      - name: Integrate SukiSU-Ultra (builtin branch)
+        # Z-fly/android_kernel_google_msm-4.14 验证过的组合: builtin 分支 + 4.14 兼容修正
+        # SukiSU 是单编译单元 (ksu.c 全 include), 接线方式与 KSUN 相同
+        # 完整 clone (非 shallow): Makefile 需要 git tags 计算 KSU_VERSION
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          git clone -b "${{ inputs.sukisu_ref }}" \
+            https://github.com/SukiSU-Ultra/SukiSU-Ultra.git KernelSU
+          ln -sf "$(realpath --relative-to=drivers KernelSU/kernel)" drivers/kernelsu
+          grep -q "kernelsu" drivers/Makefile || \
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || \
+            sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+      - name: SukiSU 4.14 compat fixes (from Z-fly workflow, with asserts)
+        # 1) ksud.c 的 selinux hide 调用只在 >=5.10 有效, 4.14 无条件调用编译炸
+        # 2) sulog/event.c 的 user_arg_null_ptr 返回指针语法 4.14 编译器/类型不接受
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google/KernelSU"
+          test "$(grep -Fc 'ksu_selinux_hide_handle_post_fs_data();' kernel/runtime/ksud.c)" -eq 1
+          test "$(grep -Fc 'ksu_selinux_hide_handle_second_stage();' kernel/runtime/ksud.c)" -eq 2
+          test "$(grep -Fc 'static inline struct user_arg_ptr *user_arg_null_ptr(void)' kernel/sulog/event.c)" -eq 1
+          test "$(grep -Fc 'return &null_arg;' kernel/sulog/event.c)" -eq 1
+          sed -i -e '/ksu_selinux_hide_handle_post_fs_data();/i #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)' -e '/ksu_selinux_hide_handle_post_fs_data();/a #endif' kernel/runtime/ksud.c
+          sed -i -e '/ksu_selinux_hide_handle_second_stage();/i #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)' -e '/ksu_selinux_hide_handle_second_stage();/a #endif' kernel/runtime/ksud.c
+          sed -E -i -e 's/^static inline struct user_arg_ptr \*user_arg_null_ptr\(void\)$/static inline struct user_arg_ptr user_arg_null_ptr(void)/' -e 's/^    return &null_arg;$/    return null_arg;/' kernel/sulog/event.c
+          git diff --check
+
+      - name: Restore vendor module ABI (Z-fly)
+        # SukiSU 通过 struct seccomp 扩展 task_struct, MODVERSIONS=y 时改变导出符号 CRC
+        # 导致 vendor WLAN/ADSP 拒载; 移除该扩展恢复原厂 ABI
+        # (我们另有 MODVERSIONS=n + vermagic bypass 双保险, 此步仍以 Z-fly 实证为准保留)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          seccomp_header=include/linux/seccomp.h
+          test "$(grep -Fxc '#include <linux/atomic.h>' "$seccomp_header")" -eq 1
+          test "$(grep -Ec '^[[:space:]]*atomic_t[[:space:]]+filter_count;$' "$seccomp_header")" -eq 1
+          sed -E -i -e '/^#include <linux\/atomic\.h>$/d' -e '/^[[:space:]]*atomic_t[[:space:]]+filter_count;$/d' "$seccomp_header"
+          if grep -Fxq '#include <linux/atomic.h>' "$seccomp_header" || grep -Eq '^[[:space:]]*atomic_t[[:space:]]+filter_count;$' "$seccomp_header"; then
+            echo "Failed to restore the floral vendor module ABI." >&2
+            exit 1
+          fi
+          git diff --check -- "$seccomp_header"
+
+      - name: Apply SUSFS kernel patches (4.14 branch, v1.5.5)
+        if: inputs.with_susfs == 'true'
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          git clone --depth 1 -b kernel-4.14 \
+            https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+          cd private/msm-google
+          cp ../../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch .
+          cp ../../susfs4ksu/kernel_patches/fs/* fs/
+          cp ../../susfs4ksu/kernel_patches/include/linux/* include/linux/
+          patch -p1 --forward < 50_add_susfs_in_kernel-4.14.patch || true
+          echo "=== rejected hunks after susfs patch ==="
+          find . -name "*.rej" -not -path "./out/*"
+
+      - name: Apply coral fdinfo fixup
+        if: inputs.with_susfs == 'true'
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          patch -p1 < "$GITHUB_WORKSPACE/scripts/coral_fdinfo_susfs_fixup.patch"
+          rm -f fs/notify/fdinfo.c.rej fs/notify/fdinfo.c.orig
+
+      - name: Apply official SukiSU manual hooks for 4.14
+        # coral 无 KPROBES, 必须 manual hooks; handler 签名已在本地核对与 SukiSU builtin 匹配
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/main/4.14/ksu_hooks_4.14.patch" -o ksu_hooks_4.14.patch
+          patch -p1 --forward < ksu_hooks_4.14.patch || true
+          echo "=== rejected hunks after hooks patch ==="
+          find . -name "*.rej" -not -path "./out/*"
+
+      - name: Apply coral hooks fixup (exec.c 函数结构差异 + stat.c 上下文缺失)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          patch -p1 < "$GITHUB_WORKSPACE/scripts/coral_hooks_fixup.patch"
+          rm -f fs/exec.c.rej fs/exec.c.orig fs/stat.c.rej fs/stat.c.orig
+          UNEXPECTED=$(find . -name "*.rej" -not -path "./out/*")
+          if [ -n "$UNEXPECTED" ]; then
+            echo "Unexpected rejects: $UNEXPECTED"
+            exit 1
+          fi
+
+      - name: Apply vermagic bypass (vendor 预置模块版本串与自编译内核不一致)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          git apply "$GITHUB_WORKSPACE/scripts/coral_vermagic_bypass.patch"
+
+      - name: Enable configs in floral_defconfig
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          DEFCONFIG="arch/arm64/configs/floral_defconfig"
+          test -f "$DEFCONFIG"
+          enable_opt() {
+            local opt="$1"
+            if grep -q "^# $opt is not set$" "$DEFCONFIG"; then
+              sed -i "s/^# $opt is not set$/$opt=y/" "$DEFCONFIG"
+            elif grep -q "^$opt=" "$DEFCONFIG"; then
+              sed -i "s/^$opt=.*/$opt=y/" "$DEFCONFIG"
+            else
+              printf '%s=y\n' "$opt" >> "$DEFCONFIG"
+            fi
+          }
+          enable_opt CONFIG_KSU
+          # SUSFS 选项集: 只开 susfs4ksu kernel-4.14 (v1.5.5) 补丁实际支持的子集
+          # SukiSU builtin 的 SUS_MAP 属 SUSFS 2.x, 4.14 无此补丁, 不开
+          if [ "${{ inputs.with_susfs }}" = "true" ]; then
+            for opt in CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH \
+                       CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SUS_KSTAT \
+                       CONFIG_KSU_SUSFS_SPOOF_UNAME CONFIG_KSU_SUSFS_ENABLE_LOG \
+                       CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+                       CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+                       CONFIG_KSU_SUSFS_OPEN_REDIRECT; do
+              enable_opt "$opt"
+            done
+          fi
+
+          # ThinLTO (全量 LTO 在 runner 链接阶段内存爆炸)
+          if grep -q "^# CONFIG_THINLTO is not set$" "$DEFCONFIG"; then
+            sed -i "s/^# CONFIG_THINLTO is not set$/CONFIG_THINLTO=y/" "$DEFCONFIG"
+          elif ! grep -q "^CONFIG_THINLTO=y" "$DEFCONFIG"; then
+            printf 'CONFIG_THINLTO=y\n' >> "$DEFCONFIG"
+          fi
+
+          # vendor 预置模块 CRC 校验关闭
+          if grep -q "^CONFIG_MODVERSIONS=y$" "$DEFCONFIG"; then
+            sed -i "s/^CONFIG_MODVERSIONS=y$/# CONFIG_MODVERSIONS is not set/" "$DEFCONFIG"
+          fi
+
+          # /proc/version 身份伪装: 与原厂 B2 逐字节一致
+          if grep -q "^CONFIG_LOCALVERSION=" "$DEFCONFIG"; then
+            sed -i 's|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION="-g6ef255005cea-ab9062920"|' "$DEFCONFIG"
+          else
+            printf 'CONFIG_LOCALVERSION="-g6ef255005cea-ab9062920"\n' >> "$DEFCONFIG"
+          fi
+          if grep -q "^CONFIG_LOCALVERSION_AUTO=y$" "$DEFCONFIG"; then
+            sed -i "s/^CONFIG_LOCALVERSION_AUTO=y$/# CONFIG_LOCALVERSION_AUTO is not set/" "$DEFCONFIG"
+          fi
+          grep -q "CONFIG_LOCALVERSION_AUTO" "$DEFCONFIG" || printf '# CONFIG_LOCALVERSION_AUTO is not set\n' >> "$DEFCONFIG"
+
+          make O="$GITHUB_WORKSPACE/kernel/out/defconfig-normalize" \
+            ARCH=arm64 CC=clang HOSTCC=clang LD=ld.lld floral_defconfig
+          make O="$GITHUB_WORKSPACE/kernel/out/defconfig-normalize" \
+            ARCH=arm64 CC=clang HOSTCC=clang LD=ld.lld savedefconfig
+          cp "$GITHUB_WORKSPACE/kernel/out/defconfig-normalize/defconfig" "$DEFCONFIG"
+          # 归一化后验证关键选项存活
+          grep -qx 'CONFIG_KSU=y' "$DEFCONFIG"
+          if [ "${{ inputs.with_susfs }}" = "true" ]; then
+            grep -qx 'CONFIG_KSU_SUSFS=y' "$DEFCONFIG" || { echo 'KSU_SUSFS lost after normalize (Kconfig deps unmet?)'; exit 1; }
+          fi
+
+      - name: Commit patched tree (clean tree => no '+' dirty suffix in kernel release)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          git add -A
+          git -c user.email=ci@local -c user.name=ci commit -qm "sukisu+susfs patches" || true
+          git status --porcelain | head -5
+
+      - name: Build kernel
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          export BUILD_CONFIG=private/msm-google/build.config.floral
+          export KBUILD_BUILD_USER="android-build"
+          export KBUILD_BUILD_HOST="abfarm-2004-0533"
+          export KBUILD_BUILD_TIMESTAMP="Wed Sep 14 08:05:09 UTC 2022"
+          export LOCALVERSION=""
+          sed -i 's|export KBUILD_BUILD_VERSION="1 repo:$repo_branch"|export KBUILD_BUILD_VERSION="1"|' \
+            build/_setup_env.sh
+          grep -n 'KBUILD_BUILD_VERSION' build/_setup_env.sh
+          build/build.sh -j2
+
+      - name: Assert kernel release matches stock B2 exactly
+        run: |
+          set -euxo pipefail
+          KR=$(find "$GITHUB_WORKSPACE/kernel/out" -name kernel.release | head -1)
+          cat "$KR"
+          grep -qx "4.14.276-g6ef255005cea-ab9062920" "$KR"
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cd "$GITHUB_WORKSPACE/kernel"
+          find out -type f \( \
+            -name 'Image.lz4-dtb' -o \
+            -name 'Image.lz4' -o \
+            -name 'Image.gz' -o \
+            -name 'Image' -o \
+            -name 'dtbo.img' -o \
+            -name 'boot.img' \
+          \) -print -exec cp -n {} "$GITHUB_WORKSPACE/artifacts/" \; || true
+          find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -ls || true
+
+      - name: Repack stock boot.img with new kernel
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE"
+          gh release download stock-boot -R qinjiuluo/coral-kernelsu-next -p coral-b2-stock-boot.img --clobber
+          cd scripts/mkbootimg
+          ARGS=$(python3 unpack_bootimg.py --boot_img "$GITHUB_WORKSPACE/coral-b2-stock-boot.img" --out unpacked --format mkbootimg)
+          KERNEL_IMG=$(find "$GITHUB_WORKSPACE/kernel/out" -name 'Image.lz4-dtb' | head -1)
+          test -n "$KERNEL_IMG"
+          cp "$KERNEL_IMG" unpacked/kernel
+          eval "python3 mkbootimg.py $ARGS -o new-boot.img"
+          python3 unpack_bootimg.py --boot_img new-boot.img --out verify >/dev/null
+          cmp verify/kernel "$KERNEL_IMG" || { echo 'FATAL: repacked kernel mismatch'; exit 1; }
+          cp new-boot.img "$GITHUB_WORKSPACE/artifacts/"
+          echo "=== repacked new-boot.img ==="
+          ls -la new-boot.img
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload kernel artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coral-sukisu-${{ inputs.with_susfs == 'true' && 'susfs' || 'nosusfs' }}
+          path: artifacts/
+          if-no-files-found: warn
