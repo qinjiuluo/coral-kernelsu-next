@@ -148,6 +148,54 @@ jobs:
           open(p, 'w').write(s)
           PYEOF
           grep -q 'override_creds(&init_cred)' KernelSU/kernel/core_hook.c
+          # 隐身: isolated 进程 (uid 99000-99999, 检测器的 MountScanProbe 就用它)
+          # 是 zygote/app-zygote 的子进程, 挂载 ns 拷贝同样带着 /data/adb/modules,
+          # 但 is_appuid 只认 10000-19999 → 永不 umount → 挂载泄露实锤。
+          # 扩进 uid 门槛; app_zygote 域的子进程同样放行 (sid 检查处补上)。
+          python3 - << 'PYEOF'
+          p = 'KernelSU/kernel/core_hook.c'
+          s = open(p).read()
+          old_uid = ('\tif (!is_appuid(new_uid) || is_unsupported_uid(new_uid.val)) {\n'
+                     '\t\t// pr_info("handle setuid ignore non application or isolated uid: %d\\n", new_uid.val);\n'
+                     '\t\treturn 0;\n'
+                     '\t}\n')
+          new_uid = ('\tif (!is_appuid(new_uid) || is_unsupported_uid(new_uid.val)) {\n'
+                     '\t\t// isolated processes (99000-99999) are zygote children too and\n'
+                     '\t\t// carry the same leaked mounts; detectors probe mounts there\n'
+                     '\t\tuid_t appid = new_uid.val % 100000;\n'
+                     '\t\tif (appid < 99000 || appid > 99999) {\n'
+                     '\t\t\treturn 0;\n'
+                     '\t\t}\n'
+                     '\t}\n')
+          assert s.count(old_uid) == 1, 'uid gate not unique'
+          s = s.replace(old_uid, new_uid, 1)
+          old_zy = ('#ifndef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
+                    '\t// check old process\'s selinux context, if it is not zygote, ignore it!\n'
+                    '\t// because some su apps may setuid to untrusted_app but they are in global mount namespace\n'
+                    '\t// when we umount for such process, that is a disaster!\n'
+                    '\tbool is_zygote_child = ksu_is_zygote(old->security);\n'
+                    '#endif\n'
+                    '\tif (!is_zygote_child) {\n')
+          new_zy = ('#ifndef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
+                    '\tbool is_zygote_child = ksu_is_zygote(old->security);\n'
+                    '#endif\n'
+                    '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
+                    '\tif (!is_zygote_child) {\n'
+                    '\t\t// useAppZygote services fork from app_zygote (different sid)\n'
+                    '\t\tstatic u32 susfs_app_zygote_sid = 0;\n'
+                    '\t\tif (!susfs_app_zygote_sid)\n'
+                    '\t\t\tsusfs_app_zygote_sid = susfs_get_sid_from_name("u:r:app_zygote:s0");\n'
+                    '\t\tif (susfs_app_zygote_sid)\n'
+                    '\t\t\tis_zygote_child = susfs_is_sid_equal(old->security, susfs_app_zygote_sid);\n'
+                    '\t}\n'
+                    '#endif\n'
+                    '\tif (!is_zygote_child) {\n')
+          assert s.count(old_zy) == 1, 'zygote check not unique'
+          s = s.replace(old_zy, new_zy, 1)
+          open(p, 'w').write(s)
+          PYEOF
+          grep -q 'susfs_get_sid_from_name("u:r:app_zygote:s0")' KernelSU/kernel/core_hook.c
+          grep -q 'appid < 99000' KernelSU/kernel/core_hook.c
 
       - name: Apply SUSFS kernel patches (4.14 branch)
         run: |
