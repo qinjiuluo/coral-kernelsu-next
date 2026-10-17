@@ -83,6 +83,10 @@ jobs:
           # 3) allowlist.c 用了 5.4+ 的 fallthrough 宏, 4.14 无定义 -> 改为注释 (纯标注无语义)
           sed -i -E 's/^([[:space:]]*)fallthrough;$/\1\/* fallthrough *\//' kernel/policy/allowlist.c
           ! grep -qE '^\s*fallthrough;' kernel/policy/allowlist.c
+          # 4) KSU_VERSION 钉到 40900 (= v4.2.0 管理器 versionCode, UAPI 2 时代配对,
+          #    消除管理器"版本不匹配"警告; 内核侧仅上报用途, 无内部逻辑依赖)
+          sed -i 's|^KSU_VERSION     := .*|KSU_VERSION     := 40900|' kernel/Makefile
+          grep -q "KSU_VERSION     := 40900" kernel/Makefile
           git diff --check
 
       - name: Restore vendor module ABI (Z-fly, conditional)
