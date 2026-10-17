@@ -85,12 +85,35 @@ jobs:
           sed -i '/selinux_status_update_policyload(0);/d' "$RULES_C"
           sed -i '/selinux_status_update_policyload(&selinux_state, 0);/d' "$RULES_C"
           ! grep -q 'selinux_status_update_policyload' "$RULES_C"
-          # 隐身: ksud 各阶段改在 init 域运行 (默认 su 域会被 /proc 扫描 + AVC tcontext 举证)
-          # init 域进程 uid0 是原厂常态, 检测器无法区分。
+          # 隐身: ksud 各阶段改在 vold 域运行 (su 域会被 /proc 扫描 + AVC tcontext 关键词举证;
+          # vold 是原厂常驻 root 域, tcontext=vold 的 AVC 拒绝是原生常态)
           KSUD_C="KernelSU/kernel/ksud.c"
-          sed -i 's|exec u:r:su:s0 root -- |exec u:r:init:s0 root -- |g' "$KSUD_C"
+          sed -i 's|exec u:r:su:s0 root -- |exec u:r:vold:s0 root -- |g' "$KSUD_C"
           ! grep -q 'exec u:r:su:s0 root' "$KSUD_C"
-          grep -c 'exec u:r:init:s0 root' "$KSUD_C" | grep -q '^4$'
+          grep -c 'exec u:r:vold:s0 root' "$KSUD_C" | grep -q '^4$'
+          # vold 域授予全量权限 (blanket allow 不产生 AVC; 比 init 域跑守护更安全)
+          python3 - << 'PYEOF'
+          p = 'KernelSU/kernel/selinux/rules.c'
+          s = open(p).read()
+          anchor = '\t// we need to save allowlist in /data/adb/ksu'
+          assert anchor in s, 'anchor missing'
+          inject = ('\t// stealth: vold blanket (ksud stages & rooted apps run under vold domain)\n'
+                    '\tksu_allow(db, "vold", ALL, ALL, ALL);\n'
+                    '\tif (db->policyvers >= POLICYDB_VERSION_XPERMS_IOCTL) {\n'
+                    '\t\tksu_allowxperm(db, "vold", ALL, "blk_file", ALL);\n'
+                    '\t\tksu_allowxperm(db, "vold", ALL, "fifo_file", ALL);\n'
+                    '\t\tksu_allowxperm(db, "vold", ALL, "chr_file", ALL);\n'
+                    '\t\tksu_allowxperm(db, "vold", ALL, "file", ALL);\n'
+                    '\t}\n'
+                    '\tksu_allow(db, "init", "vold", ALL, ALL);\n')
+          s = s.replace(anchor, inject + anchor, 1)
+          open(p, 'w').write(s)
+          PYEOF
+          grep -q 'ksu_allow(db, "vold", ALL, ALL, ALL)' "$RULES_C"
+          # 默认 profile 域一并改马甲 (授权应用提权后落在 vold 域)
+          ALW_C="KernelSU/kernel/allowlist.c"
+          sed -i 's|"u:r:su:s0"|"u:r:vold:s0"|g' "$ALW_C"
+          ! grep -q 'u:r:su:s0' "$ALW_C"
 
       - name: Apply SUSFS kernel patches (4.14 branch)
         run: |
