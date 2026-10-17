@@ -164,6 +164,19 @@ jobs:
             sed -i "s/^CONFIG_MODVERSIONS=y$/# CONFIG_MODVERSIONS is not set/" "$DEFCONFIG"
           fi
 
+          # /proc/version 泄露修复: 此前内核 release 被注入 _KernelSU-g<fork commit>,
+          # 而 /proc/version 是编译期常量, SUSFS spoof_uname 只管 uname() 系统调用
+          # 管不到它 → 银行风控 SDK 读 /proc/version 必见 KernelSU 字样。
+          # 强制 LOCALVERSION 为原厂完整后缀并关 AUTO, release 与原厂 B2 逐字节一致。
+          if grep -q "^CONFIG_LOCALVERSION=" "$DEFCONFIG"; then
+            sed -i 's|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION="-g6ef255005cea-ab9062920"|' "$DEFCONFIG"
+          else
+            printf 'CONFIG_LOCALVERSION="-g6ef255005cea-ab9062920"\n' >> "$DEFCONFIG"
+          fi
+          if grep -q "^CONFIG_LOCALVERSION_AUTO=y$" "$DEFCONFIG"; then
+            sed -i "s/^CONFIG_LOCALVERSION_AUTO=y$/# CONFIG_LOCALVERSION_AUTO is not set/" "$DEFCONFIG"
+          fi
+
           # defconfig 归一化, 让 Google check_defconfig 校验通过
           make O="$GITHUB_WORKSPACE/kernel/out/defconfig-normalize" \
             ARCH=arm64 CC=clang HOSTCC=clang LD=ld.lld floral_defconfig
@@ -176,6 +189,10 @@ jobs:
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel"
           export BUILD_CONFIG=private/msm-google/build.config.floral
+          # /proc/version 里的编译者身份伪造成 Google 构建农场
+          export KBUILD_BUILD_USER="android-build"
+          export KBUILD_BUILD_HOST="abfarm-2004-0533"
+          export KBUILD_BUILD_TIMESTAMP="Wed Sep 14 08:05:09 UTC 2022"
           build/build.sh -j2
 
       - name: Collect outputs
