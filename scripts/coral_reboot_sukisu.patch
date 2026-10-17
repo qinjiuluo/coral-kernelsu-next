@@ -11,7 +11,7 @@
  SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
  		void __user *, arg)
  {
-@@ -288,6 +292,12 @@
+@@ -288,5 +292,11 @@
  
  	/* We only trust the superuser with rebooting the system. */
  
