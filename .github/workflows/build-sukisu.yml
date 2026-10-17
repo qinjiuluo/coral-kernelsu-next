@@ -8,9 +8,9 @@ on:
         required: true
         default: "true"
       sukisu_ref:
-        description: SukiSU-Ultra branch/tag/commit
+        description: SukiSU-Ultra branch/tag/commit (default = Z-fly pinned, builtin HEAD 当前是破 WIP)
         required: true
-        default: "builtin"
+        default: "b1d534bc41941b2c818d7a1a1dac341e4aabfc2d"
 
 jobs:
   build:
@@ -51,15 +51,16 @@ jobs:
           cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
           git checkout 6ef255005ceaae118d35fba8585de7ba1d4d5efb || git rev-parse HEAD
 
-      - name: Integrate SukiSU-Ultra (builtin branch)
-        # Z-fly/android_kernel_google_msm-4.14 验证过的组合: builtin 分支 + 4.14 兼容修正
+      - name: Integrate SukiSU-Ultra
+        # Z-fly/android_kernel_google_msm-4.14 验证过的组合: pin b1d534bc + 4.14 兼容修正
+        # (builtin HEAD 2026-10 是破 WIP: track_throne 布尔参数/未定义 TRACK_THRONE_* 枚举, 勿用)
         # SukiSU 是单编译单元 (ksu.c 全 include), 接线方式与 KSUN 相同
         # 完整 clone (非 shallow): Makefile 需要 git tags 计算 KSU_VERSION
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
-          git clone -b "${{ inputs.sukisu_ref }}" \
-            https://github.com/SukiSU-Ultra/SukiSU-Ultra.git KernelSU
+          git clone https://github.com/SukiSU-Ultra/SukiSU-Ultra.git KernelSU
+          git -C KernelSU checkout "${{ inputs.sukisu_ref }}"
           ln -sf "$(realpath --relative-to=drivers KernelSU/kernel)" drivers/kernelsu
           grep -q "kernelsu" drivers/Makefile || \
             printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
@@ -79,6 +80,9 @@ jobs:
           sed -i -e '/ksu_selinux_hide_handle_post_fs_data();/i #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)' -e '/ksu_selinux_hide_handle_post_fs_data();/a #endif' kernel/runtime/ksud.c
           sed -i -e '/ksu_selinux_hide_handle_second_stage();/i #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)' -e '/ksu_selinux_hide_handle_second_stage();/a #endif' kernel/runtime/ksud.c
           sed -E -i -e 's/^static inline struct user_arg_ptr \*user_arg_null_ptr\(void\)$/static inline struct user_arg_ptr user_arg_null_ptr(void)/' -e 's/^    return &null_arg;$/    return null_arg;/' kernel/sulog/event.c
+          # 3) allowlist.c 用了 5.4+ 的 fallthrough 宏, 4.14 无定义 -> 改为注释 (纯标注无语义)
+          sed -i -E 's/^([[:space:]]*)fallthrough;$/\1\/* fallthrough *\//' kernel/policy/allowlist.c
+          ! grep -qE '^\s*fallthrough;' kernel/policy/allowlist.c
           git diff --check
 
       - name: Restore vendor module ABI (Z-fly, conditional)
