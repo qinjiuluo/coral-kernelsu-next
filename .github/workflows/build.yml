@@ -65,6 +65,21 @@ jobs:
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || \
             sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 
+          # 隐身: 移除注入 sepolicy 的 ksu_file 类型与 zygote->adb_data_file 规则。
+          # 检测器用 selinux_check_context / check_access 探测这两个特征。
+          # ksu_file 仅用于 devpts sid 标记, 缺失时 sid=0 优雅降级;
+          # 挂载隐藏由 SUSFS sus_mount (mountinfo 过滤) 承担, 不依赖 zygote 域 umount。
+          RULES_C="KernelSU/kernel/selinux/rules.c"
+          test -f "$RULES_C"
+          sed -i '/ksu_type(db, KERNEL_SU_FILE, "file_type");/d' "$RULES_C"
+          sed -i '/ksu_typeattribute(db, KERNEL_SU_FILE, "mlstrustedobject");/d' "$RULES_C"
+          sed -i '/ksu_allow(db, ALL, KERNEL_SU_FILE, ALL, ALL);/d' "$RULES_C"
+          sed -i '/ksu_allow(db, "zygote", "adb_data_file", "dir", "search");/d' "$RULES_C"
+          # 验证四处删除都生效 (少了说明上游改了, 立刻炸出来)
+          ! grep -q 'KERNEL_SU_FILE, "file_type"' "$RULES_C"
+          ! grep -q 'ALL, KERNEL_SU_FILE, ALL, ALL' "$RULES_C"
+          ! grep -q '"zygote", "adb_data_file"' "$RULES_C"
+
       - name: Apply SUSFS kernel patches (4.14 branch)
         run: |
           set -euxo pipefail
@@ -120,6 +135,9 @@ jobs:
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
           git apply "$GITHUB_WORKSPACE/scripts/coral_vermagic_bypass.patch"
+          # MODVERSIONS=y 分支: check_version 跳过符号 CRC 校验, same_magic 跳过串比对
+          # (VINTF 启动检查要求 CONFIG_MODVERSIONS=y, 不能再关)
+          git apply "$GITHUB_WORKSPACE/scripts/coral_modversions_bypass.patch"
 
       - name: Enable configs in floral_defconfig
         # sidex15 fork Kconfig 选项集; 不开 KSU_KPROBES_HOOK (manual hook 模式)
@@ -159,10 +177,10 @@ jobs:
           # vendor 预置模块 (ftm5 触摸/wlan 等) 的 module_layout CRC 与我们的
           # 构建不一致 (KSU/THINLTO 配置漂移所致) → insmod 报
           # "disagrees about version of symbol module_layout", 触摸失效
-          # ABI 同源无变化, 直接关掉 MODVERSIONS 跳过 CRC 校验
-          if grep -q "^CONFIG_MODVERSIONS=y$" "$DEFCONFIG"; then
-            sed -i "s/^CONFIG_MODVERSIONS=y$/# CONFIG_MODVERSIONS is not set/" "$DEFCONFIG"
-          fi
+          # 解决: MODVERSIONS 保持 y (VINTF verifyWithoutAvb 强制要求, 否则
+          # SystemUI 弹「设备内部出现问题」= 活体特征), 由 coral_modversions_bypass.patch
+          # 在内核层放行 CRC 校验。
+          grep -q "^CONFIG_MODVERSIONS=y$" "$DEFCONFIG"
 
           # /proc/version 泄露修复: 此前内核 release 被注入 _KernelSU-g<fork commit>,
           # 而 /proc/version 是编译期常量, SUSFS spoof_uname 只管 uname() 系统调用

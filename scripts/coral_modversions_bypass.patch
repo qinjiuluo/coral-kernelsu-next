@@ -1,0 +1,20 @@
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -1285,6 +1285,9 @@
+ 			 struct module *mod,
+ 			 const s32 *crc)
+ {
++	/* coral: vendor 预置模块的符号 CRC 与自编译内核不一致 (KSU/THINLTO 配置漂移),
++	 * ABI 同源无实质变化, 直接放行。MODVERSIONS 必须保持 y 以过 VINTF 检查。 */
++	return 1;
+ 	Elf_Shdr *sechdrs = info->sechdrs;
+ 	unsigned int versindex = info->index.vers;
+ 	unsigned int i, num_versions;
+@@ -1354,5 +1357,7 @@
+ 			     bool has_crcs)
+ {
++	/* coral: vermagic 串同样放行 (release 已身份克隆为原厂串, 双保险) */
++	return 1;
+ 	if (has_crcs) {
+ 		amagic += strcspn(amagic, " ");
+ 		bmagic += strcspn(bmagic, " ");
