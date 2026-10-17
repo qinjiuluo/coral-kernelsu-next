@@ -105,7 +105,10 @@ jobs:
                     '\t\tksu_allowxperm(db, "vold", ALL, "chr_file", ALL);\n'
                     '\t\tksu_allowxperm(db, "vold", ALL, "file", ALL);\n'
                     '\t}\n'
-                    '\tksu_allow(db, "init", "vold", ALL, ALL);\n')
+                    '\tksu_allow(db, "init", "vold", ALL, ALL);\n'
+                    '\t// 允许所有域使用 vold 进程传出的 fd (OhMyKeymint 注入器向\n'
+                    '\t// keystore2 SCM_RIGHTS 递 payload fd, 否则 fd use 被拒, 注入失败)\n'
+                    '\tksu_allow(db, ALL, "vold", "fd", "use");\n')
           s = s.replace(anchor, inject + anchor, 1)
           open(p, 'w').write(s)
           PYEOF
