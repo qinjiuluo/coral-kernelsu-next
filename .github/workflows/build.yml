@@ -114,6 +114,37 @@ jobs:
           ALW_C="KernelSU/kernel/allowlist.c"
           sed -i 's|"u:r:su:s0"|"u:r:vold:s0"|g' "$ALW_C"
           ! grep -q 'u:r:su:s0' "$ALW_C"
+          # 修复: ksu_try_umount 的 kern_path 在 fix_setuid 阶段以 app 凭据执行,
+          # /data/adb 是 0700 root → EACCES 静默 return, /data/adb/modules 的
+          # loop 挂载永远漏在 app mount ns (root 检测器直接读 mountinfo 实锤)。
+          # 用 init_cred 解析路径; path_umount 内部 can_umount/may_mount 仍然
+          # 以 current(当时的 root) 凭据校验, 语义不变。
+          python3 - << 'PYEOF'
+          p = 'KernelSU/kernel/core_hook.c'
+          s = open(p).read()
+          old = ('\tstruct path path;\n'
+                 '\tint err = kern_path(mnt, 0, &path);\n'
+                 '\tif (err) {\n'
+                 '\t\treturn;\n'
+                 '\t}\n')
+          new = ('\tstruct path path;\n'
+                 '\tconst struct cred *saved_cred;\n'
+                 '\tint err;\n'
+                 '\n'
+                 '\t/* resolve with init creds: current is the app during fix_setuid and\n'
+                 '\t * /data/adb is 0700 root, so kern_path would fail with EACCES and\n'
+                 '\t * the umount of /data/adb/modules would be silently skipped. */\n'
+                 '\tsaved_cred = override_creds(&init_cred);\n'
+                 '\terr = kern_path(mnt, 0, &path);\n'
+                 '\trevert_creds(saved_cred);\n'
+                 '\tif (err) {\n'
+                 '\t\treturn;\n'
+                 '\t}\n')
+          assert s.count(old) == 1, 'kern_path block not unique'
+          s = s.replace(old, new, 1)
+          open(p, 'w').write(s)
+          PYEOF
+          grep -q 'override_creds(&init_cred)' KernelSU/kernel/core_hook.c
 
       - name: Apply SUSFS kernel patches (4.14 branch)
         run: |
