@@ -145,6 +145,15 @@ jobs:
             exit 1
           fi
 
+      - name: Hook sys_reboot for SukiSU supercall (manager detection channel)
+        # SukiSU 不走 prctl; 管理器检测/安装 fd 走 reboot 系统调用带 magic
+        # SukiSU_patch 的 4.14 hooks 不含此调用点, 参考 Z-fly 树 kernel/reboot.c 手工接入
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          git apply "$GITHUB_WORKSPACE/scripts/coral_reboot_sukisu.patch"
+          grep -c "ksu_handle_sys_reboot" kernel/reboot.c
+
       - name: Apply vermagic bypass (vendor 预置模块版本串与自编译内核不一致)
         run: |
           set -euxo pipefail
