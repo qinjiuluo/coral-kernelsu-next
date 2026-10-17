@@ -81,22 +81,20 @@ jobs:
           sed -E -i -e 's/^static inline struct user_arg_ptr \*user_arg_null_ptr\(void\)$/static inline struct user_arg_ptr user_arg_null_ptr(void)/' -e 's/^    return &null_arg;$/    return null_arg;/' kernel/sulog/event.c
           git diff --check
 
-      - name: Restore vendor module ABI (Z-fly)
-        # SukiSU 通过 struct seccomp 扩展 task_struct, MODVERSIONS=y 时改变导出符号 CRC
-        # 导致 vendor WLAN/ADSP 拒载; 移除该扩展恢复原厂 ABI
-        # (我们另有 MODVERSIONS=n + vermagic bypass 双保险, 此步仍以 Z-fly 实证为准保留)
+      - name: Restore vendor module ABI (Z-fly, conditional)
+        # SukiSU 可借用 struct seccomp 的 atomic_t filter_count 扩展 (Makefile 自动探测
+        # KSU_OPTIONAL_SECCOMP_FILTER_CNT); Z-fly 的树自带该字段, 需移除以恢复原厂 ABI。
+        # coral 原厂 B2 树本无此字段 -> 无需处理; 仅当存在时才移除。
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
           seccomp_header=include/linux/seccomp.h
-          test "$(grep -Fxc '#include <linux/atomic.h>' "$seccomp_header")" -eq 1
-          test "$(grep -Ec '^[[:space:]]*atomic_t[[:space:]]+filter_count;$' "$seccomp_header")" -eq 1
-          sed -E -i -e '/^#include <linux\/atomic\.h>$/d' -e '/^[[:space:]]*atomic_t[[:space:]]+filter_count;$/d' "$seccomp_header"
-          if grep -Fxq '#include <linux/atomic.h>' "$seccomp_header" || grep -Eq '^[[:space:]]*atomic_t[[:space:]]+filter_count;$' "$seccomp_header"; then
-            echo "Failed to restore the floral vendor module ABI." >&2
-            exit 1
+          if [ "$(grep -Ec '^[[:space:]]*atomic_t[[:space:]]+filter_count;$' "$seccomp_header" || true)" -eq 1 ]; then
+            sed -E -i -e '/^#include <linux\/atomic\.h>$/d' -e '/^[[:space:]]*atomic_t[[:space:]]+filter_count;$/d' "$seccomp_header"
+            git diff --check -- "$seccomp_header"
+          else
+            echo "stock tree has no filter_count extension, nothing to restore"
           fi
-          git diff --check -- "$seccomp_header"
 
       - name: Apply SUSFS kernel patches (4.14 branch, v1.5.5)
         if: inputs.with_susfs == 'true'
