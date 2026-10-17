@@ -79,6 +79,12 @@ jobs:
           ! grep -q 'KERNEL_SU_FILE, "file_type"' "$RULES_C"
           ! grep -q 'ALL, KERNEL_SU_FILE, ALL, ALL' "$RULES_C"
           ! grep -q '"zygote", "adb_data_file"' "$RULES_C"
+          # 隐身: reset_avc_cache 里的 selinux_status_update_policyload 会推高
+          # /sys/fs/selinux/status 的 sequence (原厂=0), 检测器据此判定策略被改。
+          # avc_ss_reset 保留 (新规则生效必需), 只删状态页更新。
+          sed -i '/selinux_status_update_policyload(0);/d' "$RULES_C"
+          sed -i '/selinux_status_update_policyload(&selinux_state, 0);/d' "$RULES_C"
+          ! grep -q 'selinux_status_update_policyload' "$RULES_C"
 
       - name: Apply SUSFS kernel patches (4.14 branch)
         run: |
