@@ -186,6 +186,14 @@ jobs:
             ARCH=arm64 CC=clang HOSTCC=clang LD=ld.lld savedefconfig
           cp "$GITHUB_WORKSPACE/kernel/out/defconfig-normalize/defconfig" "$DEFCONFIG"
 
+      - name: Commit patched tree (clean tree => no '+' dirty suffix in kernel release)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          git add -A
+          git -c user.email=ci@local -c user.name=ci commit -qm "ksu+susfs patches" || true
+          git status --porcelain | head -5
+
       - name: Build kernel
         run: |
           set -euxo pipefail
@@ -195,7 +203,18 @@ jobs:
           export KBUILD_BUILD_USER="android-build"
           export KBUILD_BUILD_HOST="abfarm-2004-0533"
           export KBUILD_BUILD_TIMESTAMP="Wed Sep 14 08:05:09 UTC 2022"
+          # _setup_env.sh 会把 KBUILD_BUILD_VERSION 设为 "1 repo:<分支>", 原厂是干净的 "1"
+          sed -i 's|export KBUILD_BUILD_VERSION="1 repo:$repo_branch"|export KBUILD_BUILD_VERSION="1"|' \
+            build/_setup_env.sh
+          grep -n 'KBUILD_BUILD_VERSION' build/_setup_env.sh
           build/build.sh -j2
+
+      - name: Assert kernel release matches stock B2 exactly
+        run: |
+          set -euxo pipefail
+          KR=$(find "$GITHUB_WORKSPACE/kernel/out" -name kernel.release | head -1)
+          cat "$KR"
+          grep -qx "4.14.276-g6ef255005cea-ab9062920" "$KR"
 
       - name: Collect outputs
         if: always()
