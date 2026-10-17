@@ -166,6 +166,8 @@ jobs:
           enable_opt CONFIG_KSU
           # SUSFS 选项集: 只开 susfs4ksu kernel-4.14 (v1.5.5) 补丁实际支持的子集
           # SukiSU builtin 的 SUS_MAP 属 SUSFS 2.x, 4.14 无此补丁, 不开
+          # 注意: SukiSU Kconfig 里 KSU/KSU_SUSFS 均 default y,
+          # savedefconfig 最小化输出会省略处于默认值的符号, 校验必须对 .config 做
           if [ "${{ inputs.with_susfs }}" = "true" ]; then
             for opt in CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH \
                        CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SUS_KSTAT \
@@ -175,6 +177,9 @@ jobs:
                        CONFIG_KSU_SUSFS_OPEN_REDIRECT; do
               enable_opt "$opt"
             done
+          else
+            # default y, 显式关闭
+            printf '# CONFIG_KSU_SUSFS is not set\n' >> "$DEFCONFIG"
           fi
 
           # ThinLTO (全量 LTO 在 runner 链接阶段内存爆炸)
@@ -205,10 +210,12 @@ jobs:
           make O="$GITHUB_WORKSPACE/kernel/out/defconfig-normalize" \
             ARCH=arm64 CC=clang HOSTCC=clang LD=ld.lld savedefconfig
           cp "$GITHUB_WORKSPACE/kernel/out/defconfig-normalize/defconfig" "$DEFCONFIG"
-          # 归一化后验证关键选项存活
-          grep -qx 'CONFIG_KSU=y' "$DEFCONFIG"
+          # 归一化后验证关键选项存活 —— 对完整 .config 校验 (defconfig 是最小化输出,
+          # KSU/KSU_SUSFS default y 会被省略)
+          FULLCFG="$GITHUB_WORKSPACE/kernel/out/defconfig-normalize/.config"
+          grep -qx 'CONFIG_KSU=y' "$FULLCFG"
           if [ "${{ inputs.with_susfs }}" = "true" ]; then
-            grep -qx 'CONFIG_KSU_SUSFS=y' "$DEFCONFIG" || { echo 'KSU_SUSFS lost after normalize (Kconfig deps unmet?)'; exit 1; }
+            grep -qx 'CONFIG_KSU_SUSFS=y' "$FULLCFG" || { echo 'KSU_SUSFS lost after normalize (Kconfig deps unmet?)'; exit 1; }
           fi
 
       - name: Commit patched tree (clean tree => no '+' dirty suffix in kernel release)
