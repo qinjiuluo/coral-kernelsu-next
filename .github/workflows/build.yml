@@ -50,20 +50,152 @@ jobs:
         run: |
           git -C "$GITHUB_WORKSPACE/kernel/private/msm-google" log -1 --oneline
 
-      - name: Integrate KernelSU-Next 3.x (sidex15 fork, legacy-susfs-v2)
-        # 3.x legacy + sidex15 手工整合的 SUSFS. manual hook 模式 (coral 无 KPROBES)
-        # 补丁脚本化 (scripts/patch_ksun3x.py): 7 项隐身补丁, 本地已全量模拟验证
+      - name: Integrate KernelSU-Next (sidex15 fork, next-susfs_v1.5.5-v1.5.7)
+        # sidex15 是 susfs 合作者, 该分支 SUSFS 胶水内置且 API 与 susfs kernel-4.14 分支(v1.5.5)匹配
+        # (注: fork 的 aa12c9ba 是带冲突标记的 WIP merge, 勿用)
+        # CONFIG_KSU_KPROBES_HOOK 缺省关闭 = manual hook 模式, 适配无 KPROBES 的 coral
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
-          git clone --depth 1 -b legacy-susfs-v2             https://github.com/sidex15/KernelSU-Next.git KernelSU
+          git clone --depth 1 -b next-susfs_v1.5.5-v1.5.7 \
+            https://github.com/sidex15/KernelSU-Next.git KernelSU
           ln -sf "$(realpath --relative-to=drivers KernelSU/kernel)" drivers/kernelsu
           grep -q "kernelsu" drivers/Makefile || \
             printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || \
             sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-          python3 "$GITHUB_WORKSPACE/scripts/patch_ksun3x.py" KernelSU
 
+          # 隐身: 移除注入 sepolicy 的 ksu_file 类型与 zygote->adb_data_file 规则。
+          # 检测器用 selinux_check_context / check_access 探测这两个特征。
+          # ksu_file 仅用于 devpts sid 标记, 缺失时 sid=0 优雅降级;
+          # 挂载隐藏由 SUSFS sus_mount (mountinfo 过滤) 承担, 不依赖 zygote 域 umount。
+          RULES_C="KernelSU/kernel/selinux/rules.c"
+          test -f "$RULES_C"
+          sed -i '/ksu_type(db, KERNEL_SU_FILE, "file_type");/d' "$RULES_C"
+          sed -i '/ksu_typeattribute(db, KERNEL_SU_FILE, "mlstrustedobject");/d' "$RULES_C"
+          sed -i '/ksu_allow(db, ALL, KERNEL_SU_FILE, ALL, ALL);/d' "$RULES_C"
+          sed -i '/ksu_allow(db, "zygote", "adb_data_file", "dir", "search");/d' "$RULES_C"
+          # 验证四处删除都生效 (少了说明上游改了, 立刻炸出来)
+          ! grep -q 'KERNEL_SU_FILE, "file_type"' "$RULES_C"
+          ! grep -q 'ALL, KERNEL_SU_FILE, ALL, ALL' "$RULES_C"
+          ! grep -q '"zygote", "adb_data_file"' "$RULES_C"
+          # 隐身: reset_avc_cache 里的 selinux_status_update_policyload 会推高
+          # /sys/fs/selinux/status 的 sequence (原厂=0), 检测器据此判定策略被改。
+          # avc_ss_reset 保留 (新规则生效必需), 只删状态页更新。
+          sed -i '/selinux_status_update_policyload(0);/d' "$RULES_C"
+          sed -i '/selinux_status_update_policyload(&selinux_state, 0);/d' "$RULES_C"
+          ! grep -q 'selinux_status_update_policyload' "$RULES_C"
+          # 隐身: ksud 各阶段改在 vold 域运行 (su 域会被 /proc 扫描 + AVC tcontext 关键词举证;
+          # vold 是原厂常驻 root 域, tcontext=vold 的 AVC 拒绝是原生常态)
+          KSUD_C="KernelSU/kernel/ksud.c"
+          sed -i 's|exec u:r:su:s0 root -- |exec u:r:vold:s0 root -- |g' "$KSUD_C"
+          ! grep -q 'exec u:r:su:s0 root' "$KSUD_C"
+          grep -c 'exec u:r:vold:s0 root' "$KSUD_C" | grep -q '^4$'
+          # vold 域授予全量权限 (blanket allow 不产生 AVC; 比 init 域跑守护更安全)
+          python3 - << 'PYEOF'
+          p = 'KernelSU/kernel/selinux/rules.c'
+          s = open(p).read()
+          anchor = '\t// we need to save allowlist in /data/adb/ksu'
+          assert anchor in s, 'anchor missing'
+          inject = ('\t// stealth: vold blanket (ksud stages & rooted apps run under vold domain)\n'
+                    '\tksu_allow(db, "vold", ALL, ALL, ALL);\n'
+                    '\tif (db->policyvers >= POLICYDB_VERSION_XPERMS_IOCTL) {\n'
+                    '\t\tksu_allowxperm(db, "vold", ALL, "blk_file", ALL);\n'
+                    '\t\tksu_allowxperm(db, "vold", ALL, "fifo_file", ALL);\n'
+                    '\t\tksu_allowxperm(db, "vold", ALL, "chr_file", ALL);\n'
+                    '\t\tksu_allowxperm(db, "vold", ALL, "file", ALL);\n'
+                    '\t}\n'
+                    '\tksu_allow(db, "init", "vold", ALL, ALL);\n'
+                    '\t// 允许所有域使用 vold 进程传出的 fd (OhMyKeymint 注入器向\n'
+                    '\t// keystore2 SCM_RIGHTS 递 payload fd, 否则 fd use 被拒, 注入失败)\n'
+                    '\tksu_allow(db, ALL, "vold", "fd", "use");\n')
+          s = s.replace(anchor, inject + anchor, 1)
+          open(p, 'w').write(s)
+          PYEOF
+          grep -q 'ksu_allow(db, "vold", ALL, ALL, ALL)' "$RULES_C"
+          # 默认 profile 域一并改马甲 (授权应用提权后落在 vold 域)
+          ALW_C="KernelSU/kernel/allowlist.c"
+          sed -i 's|"u:r:su:s0"|"u:r:vold:s0"|g' "$ALW_C"
+          ! grep -q 'u:r:su:s0' "$ALW_C"
+          # 修复: ksu_try_umount 的 kern_path 在 fix_setuid 阶段以 app 凭据执行,
+          # /data/adb 是 0700 root → EACCES 静默 return, /data/adb/modules 的
+          # loop 挂载永远漏在 app mount ns (root 检测器直接读 mountinfo 实锤)。
+          # 用 init_cred 解析路径; path_umount 内部 can_umount/may_mount 仍然
+          # 以 current(当时的 root) 凭据校验, 语义不变。
+          python3 - << 'PYEOF'
+          p = 'KernelSU/kernel/core_hook.c'
+          s = open(p).read()
+          old = ('\tstruct path path;\n'
+                 '\tint err = kern_path(mnt, 0, &path);\n'
+                 '\tif (err) {\n'
+                 '\t\treturn;\n'
+                 '\t}\n')
+          new = ('\tstruct path path;\n'
+                 '\tconst struct cred *saved_cred;\n'
+                 '\tint err;\n'
+                 '\n'
+                 '\t/* resolve with init creds: current is the app during fix_setuid and\n'
+                 '\t * /data/adb is 0700 root, so kern_path would fail with EACCES and\n'
+                 '\t * the umount of /data/adb/modules would be silently skipped. */\n'
+                 '\tsaved_cred = override_creds(&init_cred);\n'
+                 '\terr = kern_path(mnt, 0, &path);\n'
+                 '\trevert_creds(saved_cred);\n'
+                 '\tif (err) {\n'
+                 '\t\treturn;\n'
+                 '\t}\n')
+          assert s.count(old) == 1, 'kern_path block not unique'
+          s = s.replace(old, new, 1)
+          open(p, 'w').write(s)
+          PYEOF
+          grep -q 'override_creds(&init_cred)' KernelSU/kernel/core_hook.c
+          # 隐身: isolated 进程 (uid 99000-99999, 检测器的 MountScanProbe 就用它)
+          # 是 zygote/app-zygote 的子进程, 挂载 ns 拷贝同样带着 /data/adb/modules,
+          # 但 is_appuid 只认 10000-19999 → 永不 umount → 挂载泄露实锤。
+          # 扩进 uid 门槛; app_zygote 域的子进程同样放行 (sid 检查处补上)。
+          python3 - << 'PYEOF'
+          p = 'KernelSU/kernel/core_hook.c'
+          s = open(p).read()
+          old_uid = ('\tif (!is_appuid(new_uid) || is_unsupported_uid(new_uid.val)) {\n'
+                     '\t\t// pr_info("handle setuid ignore non application or isolated uid: %d\\n", new_uid.val);\n'
+                     '\t\treturn 0;\n'
+                     '\t}\n')
+          new_uid = ('\tif (!is_appuid(new_uid) || is_unsupported_uid(new_uid.val)) {\n'
+                     '\t\t// isolated processes (99000-99999) are zygote children too and\n'
+                     '\t\t// carry the same leaked mounts; detectors probe mounts there\n'
+                     '\t\tuid_t appid = new_uid.val % 100000;\n'
+                     '\t\tif (appid < 99000 || appid > 99999) {\n'
+                     '\t\t\treturn 0;\n'
+                     '\t\t}\n'
+                     '\t}\n')
+          assert s.count(old_uid) == 1, 'uid gate not unique'
+          s = s.replace(old_uid, new_uid, 1)
+          old_zy = ('#ifndef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
+                    '\t// check old process\'s selinux context, if it is not zygote, ignore it!\n'
+                    '\t// because some su apps may setuid to untrusted_app but they are in global mount namespace\n'
+                    '\t// when we umount for such process, that is a disaster!\n'
+                    '\tbool is_zygote_child = ksu_is_zygote(old->security);\n'
+                    '#endif\n'
+                    '\tif (!is_zygote_child) {\n')
+          new_zy = ('#ifndef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
+                    '\tbool is_zygote_child = ksu_is_zygote(old->security);\n'
+                    '#endif\n'
+                    '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
+                    '\tif (!is_zygote_child) {\n'
+                    '\t\t// useAppZygote services fork from app_zygote (different sid)\n'
+                    '\t\tstatic u32 susfs_app_zygote_sid = 0;\n'
+                    '\t\tif (!susfs_app_zygote_sid)\n'
+                    '\t\t\tsusfs_app_zygote_sid = susfs_get_sid_from_name("u:r:app_zygote:s0");\n'
+                    '\t\tif (susfs_app_zygote_sid)\n'
+                    '\t\t\tis_zygote_child = susfs_is_sid_equal(old->security, susfs_app_zygote_sid);\n'
+                    '\t}\n'
+                    '#endif\n'
+                    '\tif (!is_zygote_child) {\n')
+          assert s.count(old_zy) == 1, 'zygote check not unique'
+          s = s.replace(old_zy, new_zy, 1)
+          open(p, 'w').write(s)
+          PYEOF
+          grep -q 'susfs_get_sid_from_name("u:r:app_zygote:s0")' KernelSU/kernel/core_hook.c
+          grep -q 'appid < 99000' KernelSU/kernel/core_hook.c
 
       - name: Apply SUSFS kernel patches (4.14 branch)
         run: |
@@ -76,9 +208,6 @@ jobs:
           cp ../../susfs4ksu/kernel_patches/fs/* fs/
           cp ../../susfs4ksu/kernel_patches/include/linux/* include/linux/
           patch -p1 --forward < 50_add_susfs_in_kernel-4.14.patch || true
-          # susfs.h 里 struct kstat 前置声明缺 include (3.x include 顺序触发 -Wvisibility)
-          grep -q "linux/fs.h" include/linux/susfs.h || \
-            sed -i '1i #include <linux/fs.h>' include/linux/susfs.h
           echo "=== rejected hunks after susfs patch ==="
           find . -name "*.rej" -not -path "./out/*"
 
@@ -100,9 +229,6 @@ jobs:
           cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/main/4.14/ksu_hooks_4.14.patch" -o ksu_hooks_4.14.patch
           patch -p1 --forward < ksu_hooks_4.14.patch || true
-          # 3.x MANUAL_HOOK 模式: Kbuild 检查 kernel/reboot.c 里的 ksu_handle_sys_reboot 调用点
-          patch -p1 --forward < "$GITHUB_WORKSPACE/scripts/coral_reboot_sukisu.patch" || true
-          grep -q "ksu_handle_sys_reboot" kernel/reboot.c
           echo "=== rejected hunks after hooks patch ==="
           find . -name "*.rej" -not -path "./out/*"
 
@@ -137,16 +263,17 @@ jobs:
           cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
           DEFCONFIG="arch/arm64/configs/floral_defconfig"
           test -f "$DEFCONFIG"
-          for opt in CONFIG_KSU CONFIG_KSU_MANUAL_HOOK \
+          for opt in CONFIG_KSU \
                      CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH \
                      CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SUS_KSTAT \
                      CONFIG_KSU_SUSFS_TRY_UMOUNT \
+                     CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+                     CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+                     CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
                      CONFIG_KSU_SUSFS_SPOOF_UNAME \
-                     CONFIG_KSU_SUSFS_ENABLE_LOG \
                      CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
                      CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
-                     CONFIG_KSU_SUSFS_OPEN_REDIRECT \
-                     CONFIG_KSU_SUSFS_SUS_MAP; do
+                     CONFIG_KSU_SUSFS_OPEN_REDIRECT; do
             if grep -q "^# $opt is not set$" "$DEFCONFIG"; then
               sed -i "s/^# $opt is not set$/$opt=y/" "$DEFCONFIG"
             elif grep -q "^$opt=" "$DEFCONFIG"; then
@@ -214,9 +341,6 @@ jobs:
           # 4.14 Makefile: LOCALVERSION_AUTO=n 且环境变量 LOCALVERSION 未 set 时,
           # 会检查 git dirty 并追加 '+' —— export 空值(即 set)即可跳过
           export LOCALVERSION=""
-          # out/ 每次 CI 全新, 跳过 mrproper: 3.x Kbuild 在 clean 阶段也会做
-          # MANUAL_HOOK 检测 (此时 .config 不存在 → 误报 No hooks), 且省 3 分钟
-          export SKIP_MRPROPER=1
           # _setup_env.sh 会把 KBUILD_BUILD_VERSION 设为 "1 repo:<分支>", 原厂是干净的 "1"
           sed -i 's|export KBUILD_BUILD_VERSION="1 repo:$repo_branch"|export KBUILD_BUILD_VERSION="1"|' \
             build/_setup_env.sh
