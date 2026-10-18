@@ -55,7 +55,7 @@ jobs:
         # 补丁脚本化 (scripts/patch_ksun3x.py): 7 项隐身补丁, 本地已全量模拟验证
         run: |
           set -euxo pipefail
-          cd "$GITHUB_WORKSPACE/kernel"
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
           git clone --depth 1 -b legacy-susfs-v2             https://github.com/sidex15/KernelSU-Next.git KernelSU
           ln -sf "$(realpath --relative-to=drivers KernelSU/kernel)" drivers/kernelsu
           grep -q "kernelsu" drivers/Makefile || \
