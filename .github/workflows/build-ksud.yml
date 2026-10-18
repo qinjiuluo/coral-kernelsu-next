@@ -103,6 +103,42 @@ jobs:
           grep -c 'privatize(' ksun/userspace/ksud_overlayfs/src/mount.rs
           grep -n 'JingMatrix' ksun/userspace/ksud_overlayfs/Cargo.toml ksun/userspace/ksud_overlayfs/Cargo.lock
 
+      - name: Patch main.rs (mount group-id tracer)
+        #  诊断: 用 kprobe 记录 mnt_alloc_group_id 的调用方栈 + 返回值,
+        #  定位挂载组 id 30/31/41 的分配者 (春秋"挂载间隙")
+        run: |
+          set -euxo pipefail
+          python3 - << 'PYEOF'
+          p = 'ksun/userspace/ksud_overlayfs/src/main.rs'
+          s = open(p).read()
+          old = '''fn main() -> anyhow::Result<()> {
+              cli::run()
+          }'''
+          new = '''fn setup_mount_trace() {
+              // trace who allocates mount peer-group ids
+              let base = if std::path::Path::new("/sys/kernel/tracing/kprobe_events").exists() {
+                  "/sys/kernel/tracing"
+              } else if std::path::Path::new("/sys/kernel/debug/tracing/kprobe_events").exists() {
+                  "/sys/kernel/debug/tracing"
+              } else {
+                  return;
+              };
+              let _ = std::fs::write(format!("{base}/kprobe_events"), "p:agid mnt_alloc_group_id\\nr:agidret mnt_alloc_group_id $retval\\n");
+              let _ = std::fs::write(format!("{base}/events/kprobes/agid/enable"), "1");
+              let _ = std::fs::write(format!("{base}/events/kprobes/agidret/enable"), "1");
+              let _ = std::fs::write(format!("{base}/events/kprobes/agid/trigger"), "stacktrace");
+          }
+
+          fn main() -> anyhow::Result<()> {
+              setup_mount_trace();
+              cli::run()
+          }'''
+          assert s.count(old) == 1
+          s = s.replace(old, new, 1)
+          open(p, 'w').write(s)
+          PYEOF
+          grep -c 'setup_mount_trace' ksun/userspace/ksud_overlayfs/src/main.rs
+
       - name: Build susfsd into ksud assets
         run: |
           cd ksun/userspace/susfsd
