@@ -1,0 +1,401 @@
+name: Build coral KernelSU-Next + SUSFS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex git libelf-dev \
+            libssl-dev python3 repo rsync unzip zip patch
+
+      - name: Configure git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Init Google Pixel 4 XL Android 13 kernel tree
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/kernel"
+          cd "$GITHUB_WORKSPACE/kernel"
+          repo init -u https://android.googlesource.com/kernel/manifest \
+            -b android-msm-coral-4.14-android13 --depth=1
+          # googlesource 对大仓偶发 502, 加重试
+          for i in 1 2 3; do
+            repo sync -c -j"$(nproc)" --no-tags --no-clone-bundle --retry-fetches=5 && break
+            echo "repo sync attempt $i failed, retrying..."
+            sleep 30
+          done
+
+      - name: Pin kernel to branch tip (matches B2 factory boot.img)
+        # B2 工厂镜像 boot.img 内核 = g6ef255005cea (分支 tip)
+        # 设备当前运行内核 gecab2e0c9918 是旧 boot 分区残留, 刷机后对齐 B2
+        # depth=1 同步下已在 tip, checkout 仅作保险
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          git checkout 6ef255005ceaae118d35fba8585de7ba1d4d5efb || git rev-parse HEAD
+
+      - name: Show source revision
+        run: |
+          git -C "$GITHUB_WORKSPACE/kernel/private/msm-google" log -1 --oneline
+
+      - name: Integrate KernelSU-Next (sidex15 fork, next-susfs_v1.5.5-v1.5.7)
+        # sidex15 是 susfs 合作者, 该分支 SUSFS 胶水内置且 API 与 susfs kernel-4.14 分支(v1.5.5)匹配
+        # (注: fork 的 aa12c9ba 是带冲突标记的 WIP merge, 勿用)
+        # CONFIG_KSU_KPROBES_HOOK 缺省关闭 = manual hook 模式, 适配无 KPROBES 的 coral
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          git clone --depth 1 -b next-susfs_v1.5.5-v1.5.7 \
+            https://github.com/sidex15/KernelSU-Next.git KernelSU
+          ln -sf "$(realpath --relative-to=drivers KernelSU/kernel)" drivers/kernelsu
+          grep -q "kernelsu" drivers/Makefile || \
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || \
+            sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+          # 隐身: 移除注入 sepolicy 的 ksu_file 类型与 zygote->adb_data_file 规则。
+          # 检测器用 selinux_check_context / check_access 探测这两个特征。
+          # ksu_file 仅用于 devpts sid 标记, 缺失时 sid=0 优雅降级;
+          # 挂载隐藏由 SUSFS sus_mount (mountinfo 过滤) 承担, 不依赖 zygote 域 umount。
+          RULES_C="KernelSU/kernel/selinux/rules.c"
+          test -f "$RULES_C"
+          sed -i '/ksu_type(db, KERNEL_SU_FILE, "file_type");/d' "$RULES_C"
+          sed -i '/ksu_typeattribute(db, KERNEL_SU_FILE, "mlstrustedobject");/d' "$RULES_C"
+          sed -i '/ksu_allow(db, ALL, KERNEL_SU_FILE, ALL, ALL);/d' "$RULES_C"
+          sed -i '/ksu_allow(db, "zygote", "adb_data_file", "dir", "search");/d' "$RULES_C"
+          # 验证四处删除都生效 (少了说明上游改了, 立刻炸出来)
+          ! grep -q 'KERNEL_SU_FILE, "file_type"' "$RULES_C"
+          ! grep -q 'ALL, KERNEL_SU_FILE, ALL, ALL' "$RULES_C"
+          ! grep -q '"zygote", "adb_data_file"' "$RULES_C"
+          # 隐身: reset_avc_cache 里的 selinux_status_update_policyload 会推高
+          # /sys/fs/selinux/status 的 sequence (原厂=0), 检测器据此判定策略被改。
+          # avc_ss_reset 保留 (新规则生效必需), 只删状态页更新。
+          sed -i '/selinux_status_update_policyload(0);/d' "$RULES_C"
+          sed -i '/selinux_status_update_policyload(&selinux_state, 0);/d' "$RULES_C"
+          ! grep -q 'selinux_status_update_policyload' "$RULES_C"
+          # 隐身: ksud 各阶段改在 vold 域运行 (su 域会被 /proc 扫描 + AVC tcontext 关键词举证;
+          # vold 是原厂常驻 root 域, tcontext=vold 的 AVC 拒绝是原生常态)
+          KSUD_C="KernelSU/kernel/ksud.c"
+          sed -i 's|exec u:r:su:s0 root -- |exec u:r:vold:s0 root -- |g' "$KSUD_C"
+          ! grep -q 'exec u:r:su:s0 root' "$KSUD_C"
+          grep -c 'exec u:r:vold:s0 root' "$KSUD_C" | grep -q '^4$'
+          # vold 域授予全量权限 (blanket allow 不产生 AVC; 比 init 域跑守护更安全)
+          python3 - << 'PYEOF'
+          p = 'KernelSU/kernel/selinux/rules.c'
+          s = open(p).read()
+          anchor = '\t// we need to save allowlist in /data/adb/ksu'
+          assert anchor in s, 'anchor missing'
+          inject = ('\t// stealth: vold blanket (ksud stages & rooted apps run under vold domain)\n'
+                    '\tksu_allow(db, "vold", ALL, ALL, ALL);\n'
+                    '\tif (db->policyvers >= POLICYDB_VERSION_XPERMS_IOCTL) {\n'
+                    '\t\tksu_allowxperm(db, "vold", ALL, "blk_file", ALL);\n'
+                    '\t\tksu_allowxperm(db, "vold", ALL, "fifo_file", ALL);\n'
+                    '\t\tksu_allowxperm(db, "vold", ALL, "chr_file", ALL);\n'
+                    '\t\tksu_allowxperm(db, "vold", ALL, "file", ALL);\n'
+                    '\t}\n'
+                    '\tksu_allow(db, "init", "vold", ALL, ALL);\n'
+                    '\t// 允许所有域使用 vold 进程传出的 fd (OhMyKeymint 注入器向\n'
+                    '\t// keystore2 SCM_RIGHTS 递 payload fd, 否则 fd use 被拒, 注入失败)\n'
+                    '\tksu_allow(db, ALL, "vold", "fd", "use");\n')
+          s = s.replace(anchor, inject + anchor, 1)
+          open(p, 'w').write(s)
+          PYEOF
+          grep -q 'ksu_allow(db, "vold", ALL, ALL, ALL)' "$RULES_C"
+          # 默认 profile 域一并改马甲 (授权应用提权后落在 vold 域)
+          ALW_C="KernelSU/kernel/allowlist.c"
+          sed -i 's|"u:r:su:s0"|"u:r:vold:s0"|g' "$ALW_C"
+          ! grep -q 'u:r:su:s0' "$ALW_C"
+          # 修复: ksu_try_umount 的 kern_path 在 fix_setuid 阶段以 app 凭据执行,
+          # /data/adb 是 0700 root → EACCES 静默 return, /data/adb/modules 的
+          # loop 挂载永远漏在 app mount ns (root 检测器直接读 mountinfo 实锤)。
+          # 用 init_cred 解析路径; path_umount 内部 can_umount/may_mount 仍然
+          # 以 current(当时的 root) 凭据校验, 语义不变。
+          python3 - << 'PYEOF'
+          p = 'KernelSU/kernel/core_hook.c'
+          s = open(p).read()
+          old = ('\tstruct path path;\n'
+                 '\tint err = kern_path(mnt, 0, &path);\n'
+                 '\tif (err) {\n'
+                 '\t\treturn;\n'
+                 '\t}\n')
+          new = ('\tstruct path path;\n'
+                 '\tconst struct cred *saved_cred;\n'
+                 '\tint err;\n'
+                 '\n'
+                 '\t/* resolve with init creds: current is the app during fix_setuid and\n'
+                 '\t * /data/adb is 0700 root, so kern_path would fail with EACCES and\n'
+                 '\t * the umount of /data/adb/modules would be silently skipped. */\n'
+                 '\tsaved_cred = override_creds(&init_cred);\n'
+                 '\terr = kern_path(mnt, 0, &path);\n'
+                 '\trevert_creds(saved_cred);\n'
+                 '\tif (err) {\n'
+                 '\t\treturn;\n'
+                 '\t}\n')
+          assert s.count(old) == 1, 'kern_path block not unique'
+          s = s.replace(old, new, 1)
+          open(p, 'w').write(s)
+          PYEOF
+          grep -q 'override_creds(&init_cred)' KernelSU/kernel/core_hook.c
+          # 隐身: isolated 进程 (uid 99000-99999, 检测器的 MountScanProbe 就用它)
+          # 是 zygote/app-zygote 的子进程, 挂载 ns 拷贝同样带着 /data/adb/modules,
+          # 但 is_appuid 只认 10000-19999 → 永不 umount → 挂载泄露实锤。
+          # 扩进 uid 门槛; app_zygote 域的子进程同样放行 (sid 检查处补上)。
+          python3 - << 'PYEOF'
+          p = 'KernelSU/kernel/core_hook.c'
+          s = open(p).read()
+          old_uid = ('\tif (!is_appuid(new_uid) || is_unsupported_uid(new_uid.val)) {\n'
+                     '\t\t// pr_info("handle setuid ignore non application or isolated uid: %d\\n", new_uid.val);\n'
+                     '\t\treturn 0;\n'
+                     '\t}\n')
+          new_uid = ('\tif (!is_appuid(new_uid) || is_unsupported_uid(new_uid.val)) {\n'
+                     '\t\t// isolated processes (99000-99999) are zygote children too and\n'
+                     '\t\t// carry the same leaked mounts; detectors probe mounts there\n'
+                     '\t\tuid_t appid = new_uid.val % 100000;\n'
+                     '\t\tif (appid < 99000 || appid > 99999) {\n'
+                     '\t\t\treturn 0;\n'
+                     '\t\t}\n'
+                     '\t}\n')
+          assert s.count(old_uid) == 1, 'uid gate not unique'
+          s = s.replace(old_uid, new_uid, 1)
+          old_zy = ('#ifndef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
+                    '\t// check old process\'s selinux context, if it is not zygote, ignore it!\n'
+                    '\t// because some su apps may setuid to untrusted_app but they are in global mount namespace\n'
+                    '\t// when we umount for such process, that is a disaster!\n'
+                    '\tbool is_zygote_child = ksu_is_zygote(old->security);\n'
+                    '#endif\n'
+                    '\tif (!is_zygote_child) {\n')
+          new_zy = ('#ifndef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
+                    '\tbool is_zygote_child = ksu_is_zygote(old->security);\n'
+                    '#endif\n'
+                    '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
+                    '\tif (!is_zygote_child) {\n'
+                    '\t\t// useAppZygote services fork from app_zygote (different sid)\n'
+                    '\t\tstatic u32 susfs_app_zygote_sid = 0;\n'
+                    '\t\tif (!susfs_app_zygote_sid)\n'
+                    '\t\t\tsusfs_app_zygote_sid = susfs_get_sid_from_name("u:r:app_zygote:s0");\n'
+                    '\t\tif (susfs_app_zygote_sid)\n'
+                    '\t\t\tis_zygote_child = susfs_is_sid_equal(old->security, susfs_app_zygote_sid);\n'
+                    '\t}\n'
+                    '#endif\n'
+                    '\tif (!is_zygote_child) {\n')
+          assert s.count(old_zy) == 1, 'zygote check not unique'
+          s = s.replace(old_zy, new_zy, 1)
+          open(p, 'w').write(s)
+          PYEOF
+          grep -q 'susfs_get_sid_from_name("u:r:app_zygote:s0")' KernelSU/kernel/core_hook.c
+          grep -q 'appid < 99000' KernelSU/kernel/core_hook.c
+
+      - name: Apply SUSFS kernel patches (4.14 branch)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          git clone --depth 1 -b kernel-4.14 \
+            https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+          cd private/msm-google
+          cp ../../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch .
+          cp ../../susfs4ksu/kernel_patches/fs/* fs/
+          cp ../../susfs4ksu/kernel_patches/include/linux/* include/linux/
+          patch -p1 --forward < 50_add_susfs_in_kernel-4.14.patch || true
+          echo "=== rejected hunks after susfs patch ==="
+          find . -name "*.rej" -not -path "./out/*"
+
+      - name: Apply coral fdinfo fixup (adapts susfs hunk to coral's fsnotify backport)
+        # coral 的 fdinfo.c 被 Google 回填过新版 fsnotify (mask/ignored_mask),
+        # susfs 4.14 补丁的 hunk #4 会 reject; 此 fixup 手工作业:
+        # 声明提前(C90) + fanotify 签名对齐
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          patch -p1 < "$GITHUB_WORKSPACE/scripts/coral_fdinfo_susfs_fixup.patch"
+          rm -f fs/notify/fdinfo.c.rej fs/notify/fdinfo.c.orig
+
+      - name: Apply official SukiSU manual hooks for 4.14
+        # 官方补丁仓 SukiSU-Ultra/SukiSU_patch, 注入 execveat/faccessat/stat/read/devpts/input/umount 调用点
+        # 其 handler 签名与 sidex15 KSUN fork 匹配 (已逐一核对)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/main/4.14/ksu_hooks_4.14.patch" -o ksu_hooks_4.14.patch
+          patch -p1 --forward < ksu_hooks_4.14.patch || true
+          echo "=== rejected hunks after hooks patch ==="
+          find . -name "*.rej" -not -path "./out/*"
+
+      - name: Apply coral hooks fixup (exec.c 函数结构差异 + stat.c SUS_SU 上下文缺失)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          patch -p1 < "$GITHUB_WORKSPACE/scripts/coral_hooks_fixup.patch"
+          rm -f fs/exec.c.rej fs/exec.c.orig fs/stat.c.rej fs/stat.c.orig
+          # 白名单外的 reject 一律炸出来
+          UNEXPECTED=$(find . -name "*.rej" -not -path "./out/*")
+          if [ -n "$UNEXPECTED" ]; then
+            echo "Unexpected rejects: $UNEXPECTED"
+            exit 1
+          fi
+
+      - name: Apply vermagic bypass (vendor 预置模块版本串与自编译内核不一致)
+        # 内核 release 被 KSUN 改写为 _KernelSU-g<commit>, 与 vendor .ko 的 vermagic 不符;
+        # MODVERSIONS=n 时 same_magic 全串比对必炸 → 内核层放行 (同源 ABI 兼容)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          git apply "$GITHUB_WORKSPACE/scripts/coral_vermagic_bypass.patch"
+          # MODVERSIONS=y 分支: check_version 跳过符号 CRC 校验, same_magic 跳过串比对
+          # (VINTF 启动检查要求 CONFIG_MODVERSIONS=y, 不能再关)
+          git apply "$GITHUB_WORKSPACE/scripts/coral_modversions_bypass.patch"
+
+      - name: Enable configs in floral_defconfig
+        # sidex15 fork Kconfig 选项集; 不开 KSU_KPROBES_HOOK (manual hook 模式)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          DEFCONFIG="arch/arm64/configs/floral_defconfig"
+          test -f "$DEFCONFIG"
+          for opt in CONFIG_KSU \
+                     CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH \
+                     CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SUS_KSTAT \
+                     CONFIG_KSU_SUSFS_TRY_UMOUNT \
+                     CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+                     CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+                     CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+                     CONFIG_KSU_SUSFS_SPOOF_UNAME \
+                     CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+                     CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+                     CONFIG_KSU_SUSFS_OPEN_REDIRECT; do
+            if grep -q "^# $opt is not set$" "$DEFCONFIG"; then
+              sed -i "s/^# $opt is not set$/$opt=y/" "$DEFCONFIG"
+            elif grep -q "^$opt=" "$DEFCONFIG"; then
+              sed -i "s/^$opt=.*/$opt=y/" "$DEFCONFIG"
+            else
+              printf '%s=y\n' "$opt" >> "$DEFCONFIG"
+            fi
+          done
+
+          # 默认 defconfig 是全量 LTO (CONFIG_LTO_CLANG=y + THINLTO off),
+          # runner 链接阶段内存爆炸被 cancel → 切 ThinLTO (保留 CFI)
+          if grep -q "^# CONFIG_THINLTO is not set$" "$DEFCONFIG"; then
+            sed -i "s/^# CONFIG_THINLTO is not set$/CONFIG_THINLTO=y/" "$DEFCONFIG"
+          elif ! grep -q "^CONFIG_THINLTO=y" "$DEFCONFIG"; then
+            printf 'CONFIG_THINLTO=y\n' >> "$DEFCONFIG"
+          fi
+
+          # vendor 预置模块 (ftm5 触摸/wlan 等) 的 module_layout CRC 与我们的
+          # 构建不一致 (KSU/THINLTO 配置漂移所致) → insmod 报
+          # "disagrees about version of symbol module_layout", 触摸失效
+          # 解决: MODVERSIONS 保持 y (VINTF verifyWithoutAvb 强制要求, 否则
+          # SystemUI 弹「设备内部出现问题」= 活体特征), 由 coral_modversions_bypass.patch
+          # 在内核层放行 CRC 校验。
+          grep -q "^CONFIG_MODVERSIONS=y$" "$DEFCONFIG"
+
+          # /proc/version 泄露修复: 此前内核 release 被注入 _KernelSU-g<fork commit>,
+          # 而 /proc/version 是编译期常量, SUSFS spoof_uname 只管 uname() 系统调用
+          # 管不到它 → 银行风控 SDK 读 /proc/version 必见 KernelSU 字样。
+          # 强制 LOCALVERSION 为原厂完整后缀并关 AUTO, release 与原厂 B2 逐字节一致。
+          if grep -q "^CONFIG_LOCALVERSION=" "$DEFCONFIG"; then
+            sed -i 's|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION="-g6ef255005cea-ab9062920"|' "$DEFCONFIG"
+          else
+            printf 'CONFIG_LOCALVERSION="-g6ef255005cea-ab9062920"\n' >> "$DEFCONFIG"
+          fi
+          if grep -q "^CONFIG_LOCALVERSION_AUTO=y$" "$DEFCONFIG"; then
+            sed -i "s/^CONFIG_LOCALVERSION_AUTO=y$/# CONFIG_LOCALVERSION_AUTO is not set/" "$DEFCONFIG"
+          fi
+          # 原 defconfig 可能没有该行(默认 y), 必须显式写入, 否则 savedefconfig 归一化时又写回 y
+          grep -q "CONFIG_LOCALVERSION_AUTO" "$DEFCONFIG" || printf '# CONFIG_LOCALVERSION_AUTO is not set\n' >> "$DEFCONFIG"
+
+          # defconfig 归一化, 让 Google check_defconfig 校验通过
+          make O="$GITHUB_WORKSPACE/kernel/out/defconfig-normalize" \
+            ARCH=arm64 CC=clang HOSTCC=clang LD=ld.lld floral_defconfig
+          make O="$GITHUB_WORKSPACE/kernel/out/defconfig-normalize" \
+            ARCH=arm64 CC=clang HOSTCC=clang LD=ld.lld savedefconfig
+          cp "$GITHUB_WORKSPACE/kernel/out/defconfig-normalize/defconfig" "$DEFCONFIG"
+
+      - name: Commit patched tree (clean tree => no '+' dirty suffix in kernel release)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/private/msm-google"
+          git add -A
+          git -c user.email=ci@local -c user.name=ci commit -qm "ksu+susfs patches" || true
+          git status --porcelain | head -5
+
+      - name: Build kernel
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          export BUILD_CONFIG=private/msm-google/build.config.floral
+          # /proc/version 里的编译者身份伪造成 Google 构建农场
+          export KBUILD_BUILD_USER="android-build"
+          export KBUILD_BUILD_HOST="abfarm-2004-0533"
+          export KBUILD_BUILD_TIMESTAMP="Wed Sep 14 08:05:09 UTC 2022"
+          # 4.14 Makefile: LOCALVERSION_AUTO=n 且环境变量 LOCALVERSION 未 set 时,
+          # 会检查 git dirty 并追加 '+' —— export 空值(即 set)即可跳过
+          export LOCALVERSION=""
+          # _setup_env.sh 会把 KBUILD_BUILD_VERSION 设为 "1 repo:<分支>", 原厂是干净的 "1"
+          sed -i 's|export KBUILD_BUILD_VERSION="1 repo:$repo_branch"|export KBUILD_BUILD_VERSION="1"|' \
+            build/_setup_env.sh
+          grep -n 'KBUILD_BUILD_VERSION' build/_setup_env.sh
+          build/build.sh -j2
+
+      - name: Assert kernel release matches stock B2 exactly
+        run: |
+          set -euxo pipefail
+          KR=$(find "$GITHUB_WORKSPACE/kernel/out" -name kernel.release | head -1)
+          cat "$KR"
+          grep -qx "4.14.276-g6ef255005cea-ab9062920" "$KR"
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cd "$GITHUB_WORKSPACE/kernel"
+          find out -type f \( \
+            -name 'Image.lz4-dtb' -o \
+            -name 'Image.lz4' -o \
+            -name 'Image.gz' -o \
+            -name 'Image' -o \
+            -name 'dtbo.img' -o \
+            -name 'boot.img' \
+          \) -print -exec cp -n {} "$GITHUB_WORKSPACE/artifacts/" \; || true
+          find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -ls || true
+
+      - name: Repack stock boot.img with new kernel
+        # SukiSU_patch 里的 magiskboot 是 ARM64 二进制, x86 runner 跑不了;
+        # 用 AOSP 纯 python mkbootimg 工具链 (已本地验证 round-trip 无损)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE"
+          gh release download stock-boot -R qinjiuluo/coral-kernelsu-next -p coral-b2-stock-boot.img --clobber
+          cd scripts/mkbootimg
+          # 注意顺序: 先解包+生成参数, 再覆盖 kernel —— 反了会被 stock kernel 回冲
+          ARGS=$(python3 unpack_bootimg.py --boot_img "$GITHUB_WORKSPACE/coral-b2-stock-boot.img" --out unpacked --format mkbootimg)
+          KERNEL_IMG=$(find "$GITHUB_WORKSPACE/kernel/out" -name 'Image.lz4-dtb' | head -1)
+          test -n "$KERNEL_IMG"
+          cp "$KERNEL_IMG" unpacked/kernel
+          eval "python3 mkbootimg.py $ARGS -o new-boot.img"
+          # 防回归: 校验新镜像里的内核 == CI 构建的内核
+          python3 unpack_bootimg.py --boot_img new-boot.img --out verify >/dev/null
+          cmp verify/kernel "$KERNEL_IMG" || { echo 'FATAL: repacked kernel mismatch'; exit 1; }
+          cp new-boot.img "$GITHUB_WORKSPACE/artifacts/"
+          echo "=== repacked new-boot.img ==="
+          ls -la new-boot.img
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload kernel artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coral-sukisu-susfs
+          path: artifacts/
+          if-no-files-found: warn
