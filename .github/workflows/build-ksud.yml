@@ -103,7 +103,7 @@ jobs:
           grep -c 'privatize(' ksun/userspace/ksud_overlayfs/src/mount.rs
           grep -n 'JingMatrix' ksun/userspace/ksud_overlayfs/Cargo.toml ksun/userspace/ksud_overlayfs/Cargo.lock
 
-      - name: Build susfsd (needed: embedded into ksud assets)
+      - name: Build susfsd into ksud assets
         run: |
           cd ksun/userspace/susfsd
           $ANDROID_NDK_LATEST_HOME/ndk-build
