@@ -116,6 +116,11 @@ jobs:
           }'''
           new = '''fn setup_mount_trace() {
               // trace who allocates mount peer-group ids
+              unsafe {
+                  let t = std::ffi::CString::new("tracefs").unwrap();
+                  let d = std::ffi::CString::new("/sys/kernel/tracing").unwrap();
+                  libc::mount(t.as_ptr(), d.as_ptr(), t.as_ptr(), 0, std::ptr::null());
+              }
               let base = if std::path::Path::new("/sys/kernel/tracing/kprobe_events").exists() {
                   "/sys/kernel/tracing"
               } else if std::path::Path::new("/sys/kernel/debug/tracing/kprobe_events").exists() {
