@@ -30,7 +30,9 @@ jobs:
               // stealth: keep ksu mounts out of shared peer groups; a freed
               // group id leaves a detectable gap in app mountinfo sequences
               unsafe {
-                  if let Ok(c) = std::ffi::CString::new(target.display().to_string()) {
+                  if let std::result::Result::Ok(c) =
+                      std::ffi::CString::new(target.display().to_string())
+                  {
                       libc::mount(
                           std::ptr::null(),
                           c.as_ptr(),
