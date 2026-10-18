@@ -103,55 +103,103 @@ jobs:
           grep -c 'privatize(' ksun/userspace/ksud_overlayfs/src/mount.rs
           grep -n 'JingMatrix' ksun/userspace/ksud_overlayfs/Cargo.toml ksun/userspace/ksud_overlayfs/Cargo.lock
 
-      - name: Patch main.rs (mount group-id watcher)
-        #  诊断: kprobes 不可用 (CONFIG_KPROBES=n), 改用 100ms 轮询 /proc/1/mountinfo
-        #  记录组 id 集合的每次变化 + 快照, 定位 id 30/31/41 的分配/释放者
+      - name: Patch diag group-id logging (mount.rs + init_event.rs)
+        #  诊断: ksud 各挂载点前后 dump /proc/1/mountinfo 的 shared 组 id 集合
+        #  到 /data/local/tmp/gid.log, 定位 id 30/31/41 的分配/释放时机
         run: |
           set -euxo pipefail
           python3 - << 'PYEOF'
-          p = 'ksun/userspace/ksud_overlayfs/src/main.rs'
-          s = open(p).read()
-          old = '''fn main() -> anyhow::Result<()> {
-              cli::run()
-          }'''
-          watcher = r'''#!/system/bin/sh
-          D=/data/local/tmp/mntwatch; mkdir -p $D; rm -f $D/log; prev=""
-          for i in $(seq 1 3000); do
-            cur=$(grep -oE "shared:[0-9]+" /proc/1/mountinfo | tr "\n" ",")
-            if [ "$cur" != "$prev" ]; then
-              echo "CHG $(cat /proc/uptime | cut -d' ' -f1) $cur" >> $D/log
-              grep -E "shared:" /proc/1/mountinfo | cut -d' ' -f1,5,7 >> $D/snap.$(date +%s%N)
-            fi
-            prev="$cur"
-            sleep 0.1
-          done
-          echo DONE >> $D/log'''
-          new = '''fn spawn_mount_watcher() {
-              if !std::env::args().any(|a| a == "post-fs-data") {
-                  return;
-              }
-              if std::path::Path::new("/data/local/tmp/mntwatch/log").exists() {
-                  return;
-              }
-              let _ = std::fs::write("/data/local/tmp/mntwatch.sh", WATCHER_RAW);
-              let _ = std::process::Command::new("/data/adb/ksu/bin/busybox")
-                  .args(["setsid", "/data/adb/ksu/bin/busybox", "sh", "/data/local/tmp/mntwatch.sh"])
-                  .spawn();
-          }
+          import io
 
-          fn main() -> anyhow::Result<()> {
-              spawn_mount_watcher();
-              cli::run()
-          }'''
-          assert s.count(old) == 1
-          s = s.replace(old, new, 1)
-          # 内嵌 watcher 脚本为 const (raw string 防转义地狱)
-          const_decl = 'const WATCHER_RAW: &str = r####"' + watcher + '"####;\n\n'
-          s = const_decl + s
+          # ---- mount.rs: diag_groups + privatize 前后记录 ----
+          p = 'ksun/userspace/ksud_overlayfs/src/mount.rs'
+          s = open(p).read()
+
+          diag = '''
+          #[cfg(any(target_os = "linux", target_os = "android"))]
+          pub fn diag_groups(tag: &str) {
+              let up = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
+              let up = up.split_whitespace().next().unwrap_or("?").to_string();
+              let mut g: Vec<u32> = vec![];
+              if let std::result::Result::Ok(mi) = std::fs::read_to_string("/proc/1/mountinfo") {
+                  for l in mi.lines() {
+                      for t in l.split_whitespace() {
+                          if let Some(r) = t.strip_prefix("shared:") {
+                              if let std::result::Result::Ok(n) = r.parse::<u32>() {
+                                  g.push(n);
+                              }
+                          }
+                      }
+                  }
+              }
+              g.sort_unstable();
+              g.dedup();
+              if let std::result::Result::Ok(mut f) = std::fs::OpenOptions::new()
+                  .create(true)
+                  .append(true)
+                  .open("/data/local/tmp/gid.log")
+              {
+                  use std::io::Write;
+                  let body: Vec<String> = g.iter().map(|n| n.to_string()).collect();
+                  let _ = writeln!(f, "{} [{}] {}", up, tag, body.join(","));
+              }
+          }
+          '''
+
+          old1 = ('    unsafe {\n'
+                  '        if let std::result::Result::Ok(c) =\n'
+                  '            std::ffi::CString::new(target.display().to_string())\n'
+                  '        {\n')
+          new1 = ('    diag_groups(&format!("pre-priv {}", target.display()));\n'
+                  '    unsafe {\n'
+                  '        if let std::result::Result::Ok(c) =\n'
+                  '            std::ffi::CString::new(target.display().to_string())\n'
+                  '        {\n')
+          assert s.count(old1) == 1, 'privatize head not found'
+          s = s.replace(old1, new1, 1)
+
+          old2 = ('            );\n'
+                  '        }\n'
+                  '    }\n'
+                  '}\n')
+          new2 = ('            );\n'
+                  '        }\n'
+                  '    }\n'
+                  '    diag_groups(&format!("post-priv {}", target.display()));\n'
+                  '}\n')
+          assert s.count(old2) == 1, 'privatize tail not found'
+          s = s.replace(old2, new2, 1)
+          s = s + diag
           open(p, 'w').write(s)
+
+          # ---- init_event.rs: 各阶段标记 ----
+          q = 'ksun/userspace/ksud_overlayfs/src/init_event.rs'
+          t = open(q).read()
+
+          a = '    ksucalls::report_post_fs_data();\n'
+          assert t.count(a) == 1
+          t = t.replace(a, a + '\n    crate::mount::diag_groups("pfd-entry");\n', 1)
+
+          b = '''    mount::AutoMountExt4::try_new(target_update_img, module_dir, false)
+                  .with_context(|| "mount module image failed".to_string())?;'''
+          assert t.count(b) == 1
+          t = t.replace(b, b + '\n\n    crate::mount::diag_groups("after-modules-img");', 1)
+
+          c = '''    if let Err(e) = mount::mount_tmpfs(utils::get_tmp_path()) {
+                  warn!("do temp dir mount failed: {e}");
+              }'''
+          assert t.count(c) == 1
+          t = t.replace(c, c + '\n\n    crate::mount::diag_groups("after-tmpfs");', 1)
+
+          d = '''    if let Err(e) = mount_modules_systemlessly(module_dir) {
+                  warn!("do systemless mount failed: {e}");
+              }'''
+          assert t.count(d) == 1
+          t = t.replace(d, d + '\n\n    crate::mount::diag_groups("after-systemless");', 1)
+
+          open(q, 'w').write(t)
           PYEOF
-          grep -c 'spawn_mount_watcher' ksun/userspace/ksud_overlayfs/src/main.rs
-          grep -c 'WATCHER_RAW' ksun/userspace/ksud_overlayfs/src/main.rs
+          grep -c 'diag_groups' ksun/userspace/ksud_overlayfs/src/mount.rs ksun/userspace/ksud_overlayfs/src/init_event.rs
 
       - name: Build susfsd into ksud assets
         run: |
