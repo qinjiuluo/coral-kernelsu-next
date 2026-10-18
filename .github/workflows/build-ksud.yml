@@ -83,8 +83,23 @@ jobs:
           assert s.count(old2) == 1, 'mount_tmpfs tail not unique'
           s = s.replace(old2, new2, 1)
           open(p, 'w').write(s)
+
+          # Kernel-SU/java-properties 仓库已被删除(404), 换 JingMatrix fork
+          t = 'ksun/userspace/ksud_overlayfs/Cargo.toml'
+          ts = open(t).read()
+          ts = ts.replace('https://github.com/Kernel-SU/java-properties.git',
+                          'https://github.com/JingMatrix/java-properties.git')
+          open(t, 'w').write(ts)
+          l = 'ksun/userspace/ksud_overlayfs/Cargo.lock'
+          ls = open(l).read()
+          old_src = 'source = "git+https://github.com/Kernel-SU/java-properties.git?branch=master#42a4aa941b70ded2dd3be9e9f892471023e70229"'
+          assert old_src in ls
+          ls = ls.replace(old_src,
+                          'source = "git+https://github.com/JingMatrix/java-properties.git?branch=master"')
+          open(l, 'w').write(ls)
           PYEOF
           grep -c 'privatize(' ksun/userspace/ksud_overlayfs/src/mount.rs
+          grep -n 'JingMatrix' ksun/userspace/ksud_overlayfs/Cargo.toml ksun/userspace/ksud_overlayfs/Cargo.lock
 
       - name: Setup Rust + cross
         run: |
