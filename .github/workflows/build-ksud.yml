@@ -201,6 +201,28 @@ jobs:
           PYEOF
           grep -c 'diag_groups' ksun/userspace/ksud_overlayfs/src/mount.rs ksun/userspace/ksud_overlayfs/src/init_event.rs
 
+      - name: Spoof ksud version to match manager (prevent auto-overwrite)
+        #  manager 开机比对 ksud 版本, 低于自身版本码(12797)就重刷原版 ksud
+        #  把我们补丁版的版本写死为 12797 / 1.0.9 → manager 认为已最新, 不再覆盖
+        run: |
+          set -euxo pipefail
+          python3 - << 'PYEOF'
+          p = 'ksun/userspace/ksud_overlayfs/build.rs'
+          s = open(p).read()
+          old = '''fn main() {
+              let (code, name) = match get_git_version() {'''
+          new = '''fn main() {
+              // version spoof: manager auto-reinstalls ksud when its version
+              // code is below the manager's; pin to manager's values so the
+              // private-mount build is never overwritten
+              let (code, name): (u32, String) = (12797u32, "1.0.9".to_string());
+              let (code, name) = match std::result::Result::Ok::<(u32, String), std::io::Error>((code, name)) {'''
+          assert s.count(old) == 1
+          s = s.replace(old, new, 1)
+          open(p, 'w').write(s)
+          PYEOF
+          grep -n '12797' ksun/userspace/ksud_overlayfs/build.rs | head -3
+
       - name: Build susfsd into ksud assets
         run: |
           cd ksun/userspace/susfsd
