@@ -1,0 +1,105 @@
+name: Build patched ksud (private mounts)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Clone sidex15 KernelSU-Next fork
+        run: |
+          git clone --depth 1 -b next-susfs_v1.5.5-v1.5.7 \
+            https://github.com/sidex15/KernelSU-Next.git ksun
+
+      - name: Patch mount.rs (privatize ksu mounts at creation)
+        #  stealth: mount_ext4 (modules.img loop) 与 mount_tmpfs (/debug_ramdisk KSU tmpfs)
+        #  创建后立即 MS_PRIVATE|MS_REC, 不加入共享 peer-group → 不分配组 id →
+        #  per-app umount 后 app mountinfo 的 master:N 序列无缺口 (春秋"挂载间隙")
+        run: |
+          set -euxo pipefail
+          python3 - << 'PYEOF'
+          p = 'ksun/userspace/ksud_overlayfs/src/mount.rs'
+          s = open(p).read()
+
+          helper = '''
+          #[cfg(any(target_os = "linux", target_os = "android"))]
+          fn privatize(target: &Path) {
+              // stealth: keep ksu mounts out of shared peer groups; a freed
+              // group id leaves a detectable gap in app mountinfo sequences
+              unsafe {
+                  if let Ok(c) = std::ffi::CString::new(target.display().to_string()) {
+                      libc::mount(
+                          std::ptr::null(),
+                          c.as_ptr(),
+                          std::ptr::null(),
+                          (libc::MS_PRIVATE | libc::MS_REC) as _,
+                          std::ptr::null(),
+                      );
+                  }
+              }
+          }
+          '''
+
+          old1 = ('    } else {\n'
+                  '        mount(lo, target.as_ref(), "ext4", MountFlags::empty(), "")?;\n'
+                  '    }\n'
+                  '    Ok(())\n'
+                  '}\n')
+          new1 = ('    } else {\n'
+                  '        mount(lo, target.as_ref(), "ext4", MountFlags::empty(), "")?;\n'
+                  '    }\n'
+                  '    privatize(target.as_ref());\n'
+                  '    Ok(())\n'
+                  '}\n' + helper)
+          assert s.count(old1) == 1, 'mount_ext4 tail not unique'
+          s = s.replace(old1, new1, 1)
+
+          old2 = ('    } else {\n'
+                  '        mount(\n'
+                  '            KSU_OVERLAY_SOURCE,\n'
+                  '            dest.as_ref(),\n'
+                  '            "tmpfs",\n'
+                  '            MountFlags::empty(),\n'
+                  '            "",\n'
+                  '        )?;\n'
+                  '    }\n'
+                  '    Ok(())\n'
+                  '}\n')
+          new2 = ('    } else {\n'
+                  '        mount(\n'
+                  '            KSU_OVERLAY_SOURCE,\n'
+                  '            dest.as_ref(),\n'
+                  '            "tmpfs",\n'
+                  '            MountFlags::empty(),\n'
+                  '            "",\n'
+                  '        )?;\n'
+                  '    }\n'
+                  '    privatize(dest.as_ref());\n'
+                  '    Ok(())\n'
+                  '}\n')
+          assert s.count(old2) == 1, 'mount_tmpfs tail not unique'
+          s = s.replace(old2, new2, 1)
+          open(p, 'w').write(s)
+          PYEOF
+          grep -c 'privatize(' ksun/userspace/ksud_overlayfs/src/mount.rs
+
+      - name: Setup Rust + cross
+        run: |
+          rustup update stable
+          RUSTFLAGS="" cargo install cross --git https://github.com/cross-rs/cross --rev 66845c1 --force
+
+      - name: Build ksud_overlayfs (aarch64-linux-android)
+        run: |
+          cd ksun
+          CROSS_NO_WARNINGS=0 cross build --target aarch64-linux-android --release \
+            --manifest-path ./userspace/ksud_overlayfs/Cargo.toml
+          ls -la userspace/ksud_overlayfs/target/aarch64-linux-android/release/ksud
+
+      - name: Upload ksud artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ksud-private-mounts
+          path: ksun/userspace/ksud_overlayfs/target/aarch64-linux-android/release/ksud
