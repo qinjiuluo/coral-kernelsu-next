@@ -133,4 +133,19 @@ if 'susfs_set_current_proc_umounted' in s:
 wr(p, s)
 print('p7 setuid app_zygote OK')
 
+# ---- p8: dispatch.c 的 susfs v2 API no-op (4.14 susfs 无此函数) ----
+p = f'{KSUN}/kernel/supercall/dispatch.c'
+s = rd(p)
+old = '            ' + TAB + 'susfs_start_sdcard_monitor_fn();'
+if old in s:
+    s = s.replace(old, '            ' + TAB + '/* susfs v2 API absent on 4.14 */', 1)
+else:
+    import re
+    s2 = re.sub(r'(\s)susfs_start_sdcard_monitor_fn\(\);',
+                r'/* susfs v2 API absent on 4.14 */', s, count=1)
+    assert s2 != s, 'p8: sdcard_monitor not found'
+    s = s2
+wr(p, s)
+print('p8 sdcard_monitor no-op OK')
+
 print('ALL 3.x PATCHES APPLIED')
