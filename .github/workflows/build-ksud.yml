@@ -103,9 +103,9 @@ jobs:
           grep -c 'privatize(' ksun/userspace/ksud_overlayfs/src/mount.rs
           grep -n 'JingMatrix' ksun/userspace/ksud_overlayfs/Cargo.toml ksun/userspace/ksud_overlayfs/Cargo.lock
 
-      - name: Patch main.rs (mount group-id tracer)
-        #  诊断: 用 kprobe 记录 mnt_alloc_group_id 的调用方栈 + 返回值,
-        #  定位挂载组 id 30/31/41 的分配者 (春秋"挂载间隙")
+      - name: Patch main.rs (mount group-id watcher)
+        #  诊断: kprobes 不可用 (CONFIG_KPROBES=n), 改用 100ms 轮询 /proc/1/mountinfo
+        #  记录组 id 集合的每次变化 + 快照, 定位 id 30/31/41 的分配/释放者
         run: |
           set -euxo pipefail
           python3 - << 'PYEOF'
@@ -114,35 +114,44 @@ jobs:
           old = '''fn main() -> anyhow::Result<()> {
               cli::run()
           }'''
-          new = '''fn setup_mount_trace() {
-              // trace who allocates mount peer-group ids
-              unsafe {
-                  let t = std::ffi::CString::new("tracefs").unwrap();
-                  let d = std::ffi::CString::new("/sys/kernel/tracing").unwrap();
-                  libc::mount(t.as_ptr(), d.as_ptr(), t.as_ptr(), 0, std::ptr::null());
-              }
-              let base = if std::path::Path::new("/sys/kernel/tracing/kprobe_events").exists() {
-                  "/sys/kernel/tracing"
-              } else if std::path::Path::new("/sys/kernel/debug/tracing/kprobe_events").exists() {
-                  "/sys/kernel/debug/tracing"
-              } else {
+          watcher = r'''#!/system/bin/sh
+          D=/data/local/tmp/mntwatch; mkdir -p $D; rm -f $D/log; prev=""
+          for i in $(seq 1 3000); do
+            cur=$(grep -oE "shared:[0-9]+" /proc/1/mountinfo | tr "\n" ",")
+            if [ "$cur" != "$prev" ]; then
+              echo "CHG $(cat /proc/uptime | cut -d' ' -f1) $cur" >> $D/log
+              grep -E "shared:" /proc/1/mountinfo | cut -d' ' -f1,5,7 >> $D/snap.$(date +%s%N)
+            fi
+            prev="$cur"
+            sleep 0.1
+          done
+          echo DONE >> $D/log'''
+          new = '''fn spawn_mount_watcher() {
+              if !std::env::args().any(|a| a == "post-fs-data") {
                   return;
-              };
-              let _ = std::fs::write(format!("{base}/kprobe_events"), "p:agid mnt_alloc_group_id\\nr:agidret mnt_alloc_group_id $retval\\n");
-              let _ = std::fs::write(format!("{base}/events/kprobes/agid/enable"), "1");
-              let _ = std::fs::write(format!("{base}/events/kprobes/agidret/enable"), "1");
-              let _ = std::fs::write(format!("{base}/events/kprobes/agid/trigger"), "stacktrace");
+              }
+              if std::path::Path::new("/data/local/tmp/mntwatch/log").exists() {
+                  return;
+              }
+              let _ = std::fs::write("/data/local/tmp/mntwatch.sh", WATCHER_RAW);
+              let _ = std::process::Command::new("/data/adb/ksu/bin/busybox")
+                  .args(["setsid", "/data/adb/ksu/bin/busybox", "sh", "/data/local/tmp/mntwatch.sh"])
+                  .spawn();
           }
 
           fn main() -> anyhow::Result<()> {
-              setup_mount_trace();
+              spawn_mount_watcher();
               cli::run()
           }'''
           assert s.count(old) == 1
           s = s.replace(old, new, 1)
+          # 内嵌 watcher 脚本为 const (raw string 防转义地狱)
+          const_decl = 'const WATCHER_RAW: &str = r####"' + watcher + '"####;\n\n'
+          s = const_decl + s
           open(p, 'w').write(s)
           PYEOF
-          grep -c 'setup_mount_trace' ksun/userspace/ksud_overlayfs/src/main.rs
+          grep -c 'spawn_mount_watcher' ksun/userspace/ksud_overlayfs/src/main.rs
+          grep -c 'WATCHER_RAW' ksun/userspace/ksud_overlayfs/src/main.rs
 
       - name: Build susfsd into ksud assets
         run: |
