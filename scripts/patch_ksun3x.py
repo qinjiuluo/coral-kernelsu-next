@@ -122,6 +122,14 @@ new = ('#ifdef CONFIG_KSU_SUSFS' + NL
        + '    }' + NL
        + '#endif // #ifdef CONFIG_KSU_SUSFS' + NL)
 s = s.replace(old, new, 1)
+# p7b: 4.14 susfs 头没有 susfs_set_current_proc_umounted 原型 (v2 API), 补 extern
+# (实现在内核 susfs.c? 若 susfs patch 无此函数则链接报错 — 查: 它只在 KSU_SUSFS 下调用,
+#  4.14 susfs 无实现 → 换成空操作以保编译)
+if 'susfs_set_current_proc_umounted' in s:
+    old2 = '    susfs_set_current_proc_umounted();'
+    new2 = ('    /* susfs v2 API absent on 4.14 branch: no-op */' + NL
+            + '    // susfs_set_current_proc_umounted();')
+    s = s.replace(old2, new2, 1)
 wr(p, s)
 print('p7 setuid app_zygote OK')
 
