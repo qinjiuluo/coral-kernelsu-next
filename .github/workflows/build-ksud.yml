@@ -103,6 +103,13 @@ jobs:
           grep -c 'privatize(' ksun/userspace/ksud_overlayfs/src/mount.rs
           grep -n 'JingMatrix' ksun/userspace/ksud_overlayfs/Cargo.toml ksun/userspace/ksud_overlayfs/Cargo.lock
 
+      - name: Build susfsd (needed: embedded into ksud assets)
+        run: |
+          cd ksun/userspace/susfsd
+          $ANDROID_NDK_LATEST_HOME/ndk-build
+          ls -la libs/arm64-v8a/
+          cp -f libs/arm64-v8a/susfsd ../ksud_overlayfs/bin/aarch64/susfsd
+
       - name: Setup Rust + cross
         run: |
           rustup update stable
