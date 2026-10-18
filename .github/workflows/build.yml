@@ -211,6 +211,9 @@ jobs:
           # 4.14 Makefile: LOCALVERSION_AUTO=n 且环境变量 LOCALVERSION 未 set 时,
           # 会检查 git dirty 并追加 '+' —— export 空值(即 set)即可跳过
           export LOCALVERSION=""
+          # out/ 每次 CI 全新, 跳过 mrproper: 3.x Kbuild 在 clean 阶段也会做
+          # MANUAL_HOOK 检测 (此时 .config 不存在 → 误报 No hooks), 且省 3 分钟
+          export SKIP_MRPROPER=1
           # _setup_env.sh 会把 KBUILD_BUILD_VERSION 设为 "1 repo:<分支>", 原厂是干净的 "1"
           sed -i 's|export KBUILD_BUILD_VERSION="1 repo:$repo_branch"|export KBUILD_BUILD_VERSION="1"|' \
             build/_setup_env.sh
