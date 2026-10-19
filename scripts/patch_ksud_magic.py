@@ -27,8 +27,12 @@ new = (
     + NL
     + '            // stealth: keep ksu tmpfs out of shared peer groups (mount gap detection)'
     + NL
-    + '            let _ = mount_change(std::path::Path::new(TEMP_DIR),'
-    + ' MountPropagationFlags::PRIVATE);'
+    + '            unsafe {'
+    + NL
+    + '                let _ = libc::mount(std::ptr::null(), TEMP_DIR.as_ptr() as *const i8,'
+    + ' std::ptr::null(), libc::MS_PRIVATE as usize, std::ptr::null());'
+    + NL
+    + '            }'
     + NL
     + '        }'
     + NL
