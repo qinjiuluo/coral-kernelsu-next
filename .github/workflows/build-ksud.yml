@@ -243,8 +243,17 @@ jobs:
             --manifest-path ./userspace/ksud_overlayfs/Cargo.toml
           ls -la userspace/ksud_overlayfs/target/aarch64-linux-android/release/ksud
 
+      - name: Build ksud_magic (aarch64-linux-android)
+        run: |
+          cd ksun
+          CROSS_NO_WARNINGS=0 cross build --target aarch64-linux-android --release \
+            --manifest-path ./userspace/ksud_magic/Cargo.toml
+          ls -la userspace/ksud_magic/target/aarch64-linux-android/release/ksud
+
       - name: Upload ksud artifact
         uses: actions/upload-artifact@v4
         with:
           name: ksud-private-mounts
-          path: ksun/userspace/ksud_overlayfs/target/aarch64-linux-android/release/ksud
+          path: |
+            ksun/userspace/ksud_overlayfs/target/aarch64-linux-android/release/ksud
+            ksun/userspace/ksud_magic/target/aarch64-linux-android/release/ksud
